@@ -22,6 +22,7 @@ import (
 
 	gin "github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/codex/models"
@@ -34,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	runtimehelps "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	sdkhandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -684,6 +686,102 @@ func TestNewServerAppliesTrustedProxyConfiguration(t *testing.T) {
 	defaultServer.engine.ServeHTTP(recorder, request)
 	if got := recorder.Body.String(); got != "198.51.100.20" {
 		t.Fatalf("default client IP = %q, want direct peer IP", got)
+	}
+}
+
+func TestUpdateClientsContextRetainsRequestLimiterGeneration(t *testing.T) {
+	startupLimits := proxyconfig.RequestLimitsConfig{
+		MaxWebsocketConnections: 1,
+		QueueTimeoutSeconds:     1,
+	}
+	server := newTestServerWithConfigMutation(t, func(cfg *proxyconfig.Config) {
+		cfg.RequestLimits = startupLimits
+	})
+	// Isolate the hot-reload target from the long-lived websocket below:
+	// UpdateClientsContext swaps BaseAPIHandler.Cfg, which races with an
+	// in-flight ResponsesWebsocket handler reading it. The registered routes
+	// keep the original handler instance, so pointing updates at a fresh
+	// handler (sharing the same AuthManager) keeps this test focused on
+	// limiter-generation retention.
+	server.handlers = sdkhandlers.NewBaseAPIHandlers(effectiveSDKConfig(server.cfg), server.handlers.AuthManager)
+
+	httpServer := httptest.NewServer(server.engine)
+	t.Cleanup(httpServer.Close)
+
+	hook := logtest.NewLocal(log.StandardLogger())
+	t.Cleanup(hook.Reset)
+
+	dialer := websocket.Dialer{}
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http") + "/v1/responses"
+	dialHeader := http.Header{"Authorization": []string{"Bearer test-key"}}
+	closeBody := func(resp *http.Response) {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}
+
+	// The first connection holds the sole WebSocket permit and stays open
+	// without sending a message, acting as the synchronization barrier that
+	// proves the startup limiter generation keeps its capacity across reloads.
+	firstConn, firstResp, errDialFirst := dialer.Dial(wsURL, dialHeader)
+	closeBody(firstResp)
+	if errDialFirst != nil {
+		t.Fatalf("first websocket dial failed: %v", errDialFirst)
+	}
+	if firstConn == nil {
+		t.Fatal("first websocket dial returned a nil connection")
+	}
+	t.Cleanup(func() { _ = firstConn.Close() })
+
+	const limiterWarning = "changes to request-limits are not applied by hot reload; restart the process to apply them"
+	for _, timeout := range []int{2, 3, 4} {
+		nextCfg := *server.cfg
+		nextCfg.RequestLimits.QueueTimeoutSeconds = timeout
+		if !server.UpdateClientsContext(context.Background(), &nextCfg) {
+			t.Fatalf("UpdateClientsContext(queue-timeout=%d) returned false", timeout)
+		}
+
+		conn, resp, errDial := dialer.Dial(wsURL, dialHeader)
+		closeBody(resp)
+		if errDial == nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			t.Fatalf("second websocket dial with queue-timeout=%d unexpectedly succeeded", timeout)
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if resp == nil {
+			t.Fatalf("second websocket dial with queue-timeout=%d returned no HTTP response: %v", timeout, errDial)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("second websocket dial with queue-timeout=%d status = %d, want %d", timeout, resp.StatusCode, http.StatusTooManyRequests)
+		}
+	}
+
+	if errClose := firstConn.Close(); errClose != nil {
+		t.Logf("closing first websocket connection: %v", errClose)
+	}
+
+	var warnings []*log.Entry
+	for _, entry := range hook.AllEntries() {
+		if entry.Message == limiterWarning {
+			warnings = append(warnings, entry)
+		}
+	}
+	if len(warnings) != 3 {
+		t.Fatalf("request-limits hot reload warnings = %d, want 3", len(warnings))
+	}
+	for i, entry := range warnings {
+		if got := entry.Data["active_request_limits"]; got != startupLimits {
+			t.Errorf("warning %d active_request_limits = %#v, want %#v", i, got, startupLimits)
+		}
+		wantRequested := startupLimits
+		wantRequested.QueueTimeoutSeconds = i + 2
+		if got := entry.Data["requested_request_limits"]; got != wantRequested {
+			t.Errorf("warning %d requested_request_limits = %#v, want %#v", i, got, wantRequested)
+		}
 	}
 }
 
@@ -3631,4 +3729,15 @@ func TestModelsWithClientVersionApplyPatchRequiresExecutor(t *testing.T) {
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"object":"list"`) || strings.Contains(recorder.Body.String(), "apply_patch_tool_type") {
 		t.Fatalf("ordinary local catalog changed: %s", recorder.Body.String())
 	}
+}
+
+// newTestServerWithConfigMutation adapts the hardening fixtures to the upstream
+// configuration-pointer helper without changing upstream trusted-proxy tests.
+func newTestServerWithConfigMutation(t *testing.T, configure func(*proxyconfig.Config), opts ...ServerOption) *Server {
+	t.Helper()
+	cfg := &proxyconfig.Config{SDKConfig: sdkconfig.SDKConfig{APIKeys: []string{"test-key"}}}
+	if configure != nil {
+		configure(cfg)
+	}
+	return newTestServerWithConfig(t, cfg, opts...)
 }

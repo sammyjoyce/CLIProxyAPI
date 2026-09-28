@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -79,20 +81,20 @@ func (s *Server) setupRoutes() {
 		v1.GET("/videos/:request_id", openaiHandlers.XAIVideosRetrieve)
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
-		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
+		s.registerWebsocketRoute(v1, "/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		v1.POST("/alpha/search", s.codexAlphaSearch)
 		v1.POST("/live", s.codexLiveHandler.Handle)
-		v1.GET("/live/:call_id", s.codexLiveHandler.HandleSideband)
+		s.registerWebsocketRoute(v1, "/live/:call_id", s.codexLiveHandler.HandleSideband)
 	}
 
 	realtimeAuth := realtimeAuthMiddleware(s.accessManager, s.codexLiveHandler)
 	standardAuth := realtimeStandardAuthMiddleware(s.accessManager)
-	s.engine.GET("/v1/realtime", realtimeAuth, s.codexLiveHandler.HandleRealtimeWebsocket)
+	s.registerWebsocketRoute(s.engine, "/v1/realtime", realtimeAuth, s.codexLiveHandler.HandleRealtimeWebsocket)
 	s.engine.POST("/v1/realtime", realtimeAuth, s.codexLiveHandler.Handle)
 	s.engine.POST("/v1/realtime/calls", realtimeAuth, s.codexLiveHandler.Handle)
-	s.engine.GET("/v1/realtime/calls/:call_id", realtimeAuth, s.codexLiveHandler.HandleSideband)
+	s.registerWebsocketRoute(s.engine, "/v1/realtime/calls/:call_id", realtimeAuth, s.codexLiveHandler.HandleSideband)
 	s.engine.POST("/v1/realtime/client_secrets", standardAuth, s.codexLiveHandler.CreateClientSecret)
 	s.engine.POST("/v1/realtime/sessions", standardAuth, s.codexLiveHandler.CreateLegacySession)
 	s.engine.POST("/v1/realtime/transcription_sessions", standardAuth, s.codexLiveHandler.HandleTranscriptionSession)
@@ -116,7 +118,7 @@ func (s *Server) setupRoutes() {
 	codexDirect := s.engine.Group("/backend-api/codex")
 	codexDirect.Use(AuthMiddleware(s.accessManager))
 	{
-		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
+		s.registerWebsocketRoute(codexDirect, "/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		codexDirect.POST("/alpha/search", s.codexAlphaSearch)
@@ -542,6 +544,59 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 	_, _ = c.Writer.Write(upstreamBody)
 }
 
+// websocketRouteSet records the routes registered as websocket upgrade
+// endpoints. setupRoutes and AttachWebsocketRoute write to it; the request
+// limiter's dedicated websocket lane reads it, so the lane tracks the routes
+// that are actually registered instead of a duplicated list.
+type websocketRouteSet struct {
+	mu     sync.RWMutex
+	routes map[string]struct{}
+}
+
+func newWebsocketRouteSet() *websocketRouteSet {
+	return &websocketRouteSet{routes: make(map[string]struct{})}
+}
+
+// addIfAbsent records pattern and reports whether it was newly added.
+func (set *websocketRouteSet) addIfAbsent(pattern string) bool {
+	if set == nil {
+		return false
+	}
+	set.mu.Lock()
+	defer set.mu.Unlock()
+	if _, exists := set.routes[pattern]; exists {
+		return false
+	}
+	set.routes[pattern] = struct{}{}
+	return true
+}
+
+// contains reports whether pattern is a registered websocket upgrade route.
+func (set *websocketRouteSet) contains(pattern string) bool {
+	if set == nil {
+		return false
+	}
+	set.mu.RLock()
+	defer set.mu.RUnlock()
+	_, exists := set.routes[pattern]
+	return exists
+}
+
+// websocketRouteRegistrar is the Gin router surface used to register websocket
+// upgrade routes; both *gin.Engine and *gin.RouterGroup satisfy it.
+type websocketRouteRegistrar interface {
+	gin.IRoutes
+	BasePath() string
+}
+
+// registerWebsocketRoute registers a GET route that upgrades to a long-lived
+// websocket and records the path the router will resolve it to, so the request
+// limiter's dedicated websocket lane cannot drift from the registered routes.
+func (s *Server) registerWebsocketRoute(group websocketRouteRegistrar, pattern string, handlers ...gin.HandlerFunc) {
+	group.GET(pattern, handlers...)
+	s.wsRoutes.addIfAbsent(path.Join(group.BasePath(), pattern))
+}
+
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
 // The handler is served as-is without additional middleware beyond the standard stack already configured.
 func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
@@ -555,14 +610,9 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	if !strings.HasPrefix(trimmed, "/") {
 		trimmed = "/" + trimmed
 	}
-	s.wsRouteMu.Lock()
-	if _, exists := s.wsRoutes[trimmed]; exists {
-		s.wsRouteMu.Unlock()
+	if !s.wsRoutes.addIfAbsent(trimmed) {
 		return
 	}
-	s.wsRoutes[trimmed] = struct{}{}
-	s.wsRouteMu.Unlock()
-
 	authMiddleware := AuthMiddleware(s.accessManager)
 	conditionalAuth := func(c *gin.Context) {
 		if !s.wsAuthEnabled.Load() {

@@ -51,6 +51,8 @@ const (
 	claudeEffortBeta                 = "effort-2025-11-24"
 	claudeServerSideFallbackBeta     = "server-side-fallback-2026-06-01"
 	claudeFallbackCreditBeta         = "fallback-credit-2026-06-01"
+	claudeMidConvoOutputConfigBeta   = "mid-conversation-output-config-2026-07-01"
+	claudeThinkingBindingControls    = "thinking-binding-controls-2026-08-01"
 	claudeStructuredOutputsBeta      = "structured-outputs-2025-12-15"
 	claudeThinkingDisplayUpdatesBeta = "thinking-display-updates-2026-08-18"
 	claudeThinkingBindingBeta        = "thinking-binding-controls-2026-08-01"
@@ -174,6 +176,11 @@ func isManagedClaudeBeta(beta string) bool {
 //	28 prompt-caching-evict-2026-05-12    evict_on_complete, or requested
 //	29 cache-diagnosis-2026-04-07         requests with diagnostics only
 //
+// Fork additions, emitted between fallback-credit and structured-outputs:
+// mid-conversation-output-config-2026-07-01 (messages carrying output_config or
+// requesting the beta). Thinking-binding controls now use upstream model gating
+// below, so the beta is emitted exactly once.
+//
 // An empty body keeps the optimistic role=system default, matching the cloaking
 // policy for unknown and future model IDs.
 func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool) string {
@@ -240,6 +247,15 @@ func claudeCodeCLIBetas(body []byte, requested map[string]bool, oauthToken bool)
 		(oauthToken && gjson.GetBytes(body, "fallbacks").Exists())
 	if shouldIncludeFallbackCredit {
 		betas = append(betas, claudeFallbackCreditBeta)
+	}
+	// Newer clients (e.g. Claude Code effort-annotation traffic) carry per-turn
+	// effort as output_config on mid-conversation system messages and may pin
+	// thinking block binding. Dropping the betas while leaving those body
+	// features makes Anthropic reject the request ("messages.N.output_config:
+	// Extra inputs are not permitted"), so both follow the request like the
+	// fallback betas above: forwarded when the caller asks or the body needs them.
+	if requested[claudeMidConvoOutputConfigBeta] || claudeBodyHasMessageOutputConfig(body) {
+		betas = append(betas, claudeMidConvoOutputConfigBeta)
 	}
 	for _, beta := range claudeCodeTrailingBetas {
 		if beta == claudeServerSideFallbackBeta || beta == claudeFallbackCreditBeta {
@@ -438,6 +454,33 @@ func claudeThinkingDisplayUpdates(body []byte) bool {
 	return display.Type == gjson.String && strings.EqualFold(strings.TrimSpace(display.String()), "updates")
 }
 
+// claudeBodyHasMessageOutputConfig reports whether any message carries an
+// output_config object, the per-turn effort annotation shape newer clients send
+// as role=system messages with empty content.
+func claudeBodyHasMessageOutputConfig(body []byte) bool {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return false
+	}
+	for _, message := range messages.Array() {
+		// Native 2.1.280 timing-only annotations use timing-2026-09-09.
+		// Preserve the gateway's legacy beta for effort and other output fields,
+		// without adding it to upstream's timing-only fingerprint.
+		legacyOutputConfig := false
+		message.Get("output_config").ForEach(func(key, _ gjson.Result) bool {
+			if key.String() != "timing" {
+				legacyOutputConfig = true
+				return false
+			}
+			return true
+		})
+		if legacyOutputConfig {
+			return true
+		}
+	}
+	return false
+}
+
 // claudeBodyUsesAdvancedToolUse reports whether the request needs
 // advanced-tool-use-2025-11-20. Claude Code 2.1.258 adds the beta only while
 // tool search is active, which puts a tool_search_tool_* server tool and
@@ -634,7 +677,8 @@ func withClaudeAdvisorToolBeta(betas string) string {
 	}
 	insertAt := len(parts)
 	for index, beta := range parts {
-		if beta == claudeAdvancedToolUseBeta ||
+		if beta == claudeMidConvoOutputConfigBeta || beta == claudeThinkingBindingControls ||
+			beta == claudeAdvancedToolUseBeta ||
 			beta == claudeEffortBeta ||
 			beta == claudeServerSideFallbackBeta ||
 			beta == claudeFallbackCreditBeta ||

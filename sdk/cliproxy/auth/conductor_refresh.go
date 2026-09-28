@@ -605,12 +605,20 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	defer lock.mu.Unlock()
 
 	m.mu.RLock()
-	auth := m.auths[id].Clone()
+	live := m.auths[id]
 	var exec ProviderExecutor
-	if auth != nil {
+	if live != nil {
 		// Use the same effective provider key as request execution so OpenAI-compat
 		// auths registered under namespaced keys still resolve for refresh.
-		exec, _ = m.executorLocked(executorKeyFromAuth(auth))
+		exec, _ = m.executorLocked(executorKeyFromAuth(live))
+	}
+	// Snapshot the credential under the same read lock, like GetByID: a single
+	// Auth is shared with the request and persist paths, so reading its metadata
+	// map after the lock is released races their writes.
+	auth := live.Clone()
+	currentAccessToken := ""
+	if auth != nil {
+		currentAccessToken = authAccessToken(auth)
 	}
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
@@ -628,7 +636,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 
 	// Another request may already have refreshed this credential.
 	if failedAccessToken != "" {
-		if currentToken := authAccessToken(auth); currentToken != "" && currentToken != failedAccessToken {
+		if currentAccessToken != "" && currentAccessToken != failedAccessToken {
 			return auth.Clone(), nil
 		}
 	}

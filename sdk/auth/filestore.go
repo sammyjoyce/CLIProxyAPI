@@ -13,6 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	log "github.com/sirupsen/logrus"
+
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -112,18 +115,18 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 
 	switch {
 	case auth.Storage != nil:
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
-		}
-		auth.Metadata["disabled"] = auth.Disabled
+		claude.StoreMetadataValue(&auth.Metadata, "disabled", auth.Disabled)
 		if setter, ok := auth.Storage.(metadataSetter); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
+		if err = hydrateAuthMetadataFromFile(&auth.Metadata, path); err != nil {
+			return "", err
+		}
 	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
+		claude.StoreMetadataValue(&auth.Metadata, "disabled", auth.Disabled)
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
@@ -465,6 +468,31 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	s.dirLock.RLock()
 	defer s.dirLock.RUnlock()
 	return s.baseDir
+}
+
+// hydrateAuthMetadataFromFile fills missing keys in Save's initialized metadata
+// map without round-tripping existing overrides and their Go types through JSON.
+// The merge runs under the Claude metadata lock via claude.MergeMissingMetadata,
+// so it cannot race the readers that go through internal/auth/claude.
+func hydrateAuthMetadataFromFile(metadata *map[string]any, path string) error {
+	raw, errRead := os.ReadFile(path)
+	if os.IsNotExist(errRead) {
+		// No-op TokenStorage implementations need not create a file.
+		return nil
+	}
+	if errRead != nil {
+		return fmt.Errorf("auth filestore: reread persisted file failed: %w", errRead)
+	}
+	var persisted map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
+		// The file was already written successfully; hydration is best-effort
+		// and must not fail an otherwise-successful Save.
+		log.Warnf("auth filestore: unmarshal persisted file %s for metadata hydration failed: %v", path, errUnmarshal)
+		return nil
+	}
+	cliproxyauth.NormalizeCredentialMetadata(persisted)
+	claude.MergeMissingMetadata(metadata, persisted)
+	return nil
 }
 
 func extractAccessToken(metadata map[string]any) string {

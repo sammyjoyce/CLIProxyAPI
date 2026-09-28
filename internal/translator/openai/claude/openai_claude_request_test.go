@@ -757,8 +757,8 @@ func TestConvertClaudeRequestToOpenAI_ToolResultTextAndImageContent(t *testing.T
 	if !relayContent.IsArray() {
 		t.Fatalf("Expected relay content array, got %s", relayContent.Raw)
 	}
-	if got := relayContent.Get("0.text").String(); got != toolResultImageRelayNotice {
-		t.Fatalf("Expected relay notice %q, got %q", toolResultImageRelayNotice, got)
+	if got := relayContent.Get("0.text").String(); got != ToolResultImageRelayNotice {
+		t.Fatalf("Expected relay notice %q, got %q", ToolResultImageRelayNotice, got)
 	}
 	if got := relayContent.Get("1.type").String(); got != "image_url" {
 		t.Fatalf("Expected relay content type %q, got %q", "image_url", got)
@@ -871,8 +871,8 @@ func TestConvertClaudeRequestToOpenAI_ToolResultImageMergesIntoUserText(t *testi
 	if got := len(content.Array()); got != 3 {
 		t.Fatalf("Expected 3 user content parts, got %d: %s", got, content.Raw)
 	}
-	if got := content.Get("0.text").String(); got != toolResultImageRelayNotice {
-		t.Fatalf("Expected relay notice %q, got %q", toolResultImageRelayNotice, got)
+	if got := content.Get("0.text").String(); got != ToolResultImageRelayNotice {
+		t.Fatalf("Expected relay notice %q, got %q", ToolResultImageRelayNotice, got)
 	}
 	if got := content.Get("1.type").String(); got != "image_url" {
 		t.Fatalf("Expected second part type %q, got %q", "image_url", got)
@@ -954,8 +954,8 @@ func TestConvertClaudeRequestToOpenAI_MultipleToolResultsWithImages(t *testing.T
 	if len(relayContent) != 3 {
 		t.Fatalf("Expected 3 parts in relay (notice + 2 images), got %d: %s", len(relayContent), messages[3].Get("content").Raw)
 	}
-	if got := relayContent[0].Get("text").String(); got != toolResultImageRelayNotice {
-		t.Fatalf("Expected notice %q, got %q", toolResultImageRelayNotice, got)
+	if got := relayContent[0].Get("text").String(); got != ToolResultImageRelayNotice {
+		t.Fatalf("Expected notice %q, got %q", ToolResultImageRelayNotice, got)
 	}
 	if got := relayContent[1].Get("image_url.url").String(); got != "data:image/png;base64,img1" {
 		t.Fatalf("Expected image 1 url, got %q", got)

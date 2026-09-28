@@ -14,12 +14,18 @@ const (
 	claudeDeviceIDByteSize     = 32
 )
 
-// claudeDevicePoolMu guards every concurrent access to a Claude credential's
+// claudeDevicePoolMu guards this package's access to a Claude credential's
 // Auth.Metadata map, not just the device pool. A single Auth is shared by all
 // in-flight requests using that credential, and Go maps are not safe for
-// concurrent read/write, so the account-profile and refresh paths have to take
-// the same lock as the pool paths. Reaching into Auth.Metadata directly from a
-// request path is a data race even when the keys differ.
+// concurrent read/write, so the device-pool, account-profile, refresh, and
+// persist paths have to take the same lock as the pool paths. Reaching into
+// Auth.Metadata from a Claude request path without this lock is a data race
+// even when the keys differ.
+//
+// The guard is package-scoped: code outside internal/auth/claude touches the
+// same map without it - Auth.Clone ranges it, the plugin host indexes it, and
+// FileTokenStore marshals it - so this mutex is not by itself an ownership
+// boundary for Auth.Metadata.
 var claudeDevicePoolMu sync.Mutex
 
 // GenerateDeviceIDPool creates the fixed-size device pool stored with a Claude credential.
@@ -174,7 +180,8 @@ func StoreDeviceIDPool(metadata *map[string]any, deviceIDs []string) {
 }
 
 // ReadMetadataString reads a string-valued metadata entry under the metadata
-// lock, so it cannot observe a map being concurrently written by another path.
+// lock, so it cannot observe a map being concurrently written by another writer
+// that goes through this package.
 func ReadMetadataString(metadata *map[string]any, key string) string {
 	if metadata == nil {
 		return ""
@@ -186,6 +193,19 @@ func ReadMetadataString(metadata *map[string]any, key string) string {
 		return ""
 	}
 	value, _ := (*metadata)[key].(string)
+	return value
+}
+
+// ReadMetadataBool reads a boolean metadata entry under the metadata lock.
+// Missing entries and non-boolean values return false without coercion.
+func ReadMetadataBool(metadata *map[string]any, key string) bool {
+	if metadata == nil {
+		return false
+	}
+	claudeDevicePoolMu.Lock()
+	defer claudeDevicePoolMu.Unlock()
+
+	value, _ := (*metadata)[key].(bool)
 	return value
 }
 
@@ -218,6 +238,26 @@ func StoreMetadataValue(metadata *map[string]any, key string, value any) {
 		*metadata = make(map[string]any)
 	}
 	(*metadata)[key] = value
+}
+
+// MergeMissingMetadata merges persisted entries into metadata under the
+// metadata lock, without overwriting existing keys. Save-side hydration goes
+// through this helper so it cannot race this package's metadata readers.
+func MergeMissingMetadata(metadata *map[string]any, persisted map[string]any) {
+	if metadata == nil {
+		return
+	}
+	claudeDevicePoolMu.Lock()
+	defer claudeDevicePoolMu.Unlock()
+
+	if *metadata == nil {
+		*metadata = make(map[string]any, len(persisted))
+	}
+	for key, value := range persisted {
+		if _, exists := (*metadata)[key]; !exists {
+			(*metadata)[key] = value
+		}
+	}
 }
 
 // EnsureMetadataMap initializes the metadata map under the metadata lock.

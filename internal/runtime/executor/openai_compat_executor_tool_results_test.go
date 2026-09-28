@@ -9,12 +9,17 @@ import (
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	openaiclaude "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/openai/claude"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
+// TestOpenAICompatExecutorToolResultContentByInputModalities pins the upstream
+// Claude-to-OpenAI tool-result shape: multimodal tool content becomes string
+// text plus an image-bearing user relay labeled with the relay notice, and only
+// a model configured to exclude image input loses the relayed images.
 func TestOpenAICompatExecutorToolResultContentByInputModalities(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -26,6 +31,8 @@ func TestOpenAICompatExecutorToolResultContentByInputModalities(t *testing.T) {
 		{name: "stream text-only", stream: true, inputModalities: []string{"text"}, wantString: true},
 		{name: "non-stream multimodal", stream: false, inputModalities: []string{"text", "image"}, wantString: false},
 		{name: "non-stream unspecified", stream: false, inputModalities: nil, wantString: false},
+		{name: "stream multimodal", stream: true, inputModalities: []string{"text", "image"}, wantString: false},
+		{name: "stream unspecified", stream: true, inputModalities: nil, wantString: false},
 	}
 
 	for _, tt := range tests {
@@ -103,8 +110,25 @@ func TestOpenAICompatExecutorToolResultContentByInputModalities(t *testing.T) {
 				if toolContent.String() != "image inspected" {
 					t.Fatalf("tool content = %q, want %q", toolContent.String(), "image inspected")
 				}
-				if !strings.Contains(string(gotBody), "image_url") {
-					t.Fatalf("multimodal model did not receive relayed image_url part:\n%s", string(gotBody))
+				messages := gjson.GetBytes(gotBody, "messages")
+				if !messages.IsArray() || len(messages.Array()) != 3 {
+					t.Fatalf("messages = %s, want the assistant tool call, the tool result and the relayed user message; body=%s", messages.Raw, string(gotBody))
+				}
+				if got := gjson.GetBytes(gotBody, "messages.2.role").String(); got != "user" {
+					t.Fatalf("messages.2 role = %q, want user; body=%s", got, string(gotBody))
+				}
+				relayParts := gjson.GetBytes(gotBody, "messages.2.content").Array()
+				if len(relayParts) != 2 {
+					t.Fatalf("relayed user parts = %s, want the relay notice plus one image part; body=%s", gjson.GetBytes(gotBody, "messages.2.content").Raw, string(gotBody))
+				}
+				if got := strings.TrimSpace(relayParts[0].Get("text").String()); got != openaiclaude.ToolResultImageRelayNotice {
+					t.Fatalf("relayed user content = %s, want the relay notice first; body=%s", gjson.GetBytes(gotBody, "messages.2.content").Raw, string(gotBody))
+				}
+				if got := relayParts[1].Get("type").String(); got != "image_url" {
+					t.Fatalf("relayed part type = %q, want image_url; body=%s", got, string(gotBody))
+				}
+				if url := relayParts[1].Get("image_url.url").String(); !strings.HasPrefix(url, "data:image/png;base64,AA==") {
+					t.Fatalf("relayed image url = %q, want the original base64 payload; body=%s", url, string(gotBody))
 				}
 			}
 		})
@@ -169,8 +193,10 @@ func TestTextOnlyModelDoesNotReceiveImageURL(t *testing.T) {
 				}
 			}
 
-			if strings.Contains(string(gotBody), "image_url") {
-				t.Fatalf("text-only model still received an image_url part:\n%s", string(gotBody))
+			for _, leaked := range []string{"image_url", "base64", "AA=="} {
+				if strings.Contains(string(gotBody), leaked) {
+					t.Fatalf("text-only request still carries %q; body=%s", leaked, string(gotBody))
+				}
 			}
 		})
 	}

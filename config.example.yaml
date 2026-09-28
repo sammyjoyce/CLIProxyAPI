@@ -46,6 +46,16 @@ server:
   # When true, disable high-overhead request logging and HTTP middleware features to reduce per-request memory usage under high concurrency.
   commercial-mode: false
 
+  # Custom gateway safeguards: bound in-flight proxy requests before their bodies are read.
+  # A positive WebSocket limit gives upgrades a separate connection budget; zero keeps them
+  # in the ordinary request budget for backward compatibility.
+  # Request-limit values are startup-scoped. Hot reload ignores changes; restart to apply them.
+  # request-limits:
+  #   max-concurrent: 128
+  #   max-websocket-connections: 256
+  #   max-queued: 128
+  #   queue-timeout-seconds: 5
+
   # Enable local network mDNS / DNS-SD service discovery (RFC 6762 / RFC 6763).
   # When enabled, broadcasts _ai-gateway._tcp with API protocol subtypes on the local network.
   # NOTE for Docker users: Link-local multicast (224.0.0.251) cannot cross default NAT bridge networks.
@@ -205,6 +215,16 @@ requests:
   # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
   # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
   proxy-url: ""
+
+  # Custom gateway safeguards: bound outbound connection establishment only.
+  # These timeouts end after a connection is established; they do not limit response/stream duration.
+  # The circuit breaker resets its failure count after a successful connection or a quiet period
+  # of circuit-breaker-cooldown-seconds. An open host circuit does not cool individual credentials.
+  # outbound-transport:
+  #   connect-timeout-seconds: 10
+  #   tls-handshake-timeout-seconds: 10
+  #   circuit-breaker-failures: 5
+  #   circuit-breaker-cooldown-seconds: 15
 
   # When true, forward filtered upstream response headers to downstream clients.
   # Default is false (disabled).
@@ -828,6 +848,7 @@ upstream:
 #           alias: "kimi-k2"               # The alias used in the API.
 #           display-name: "Kimi K2"         # optional catalog display name
 #           max-context-length: 1048576    # optional: override Codex client context window metadata
+#           max-completion-tokens: 65536   # optional: override advertised max output token metadata
 #           image: false                   # optional: set true to allow this model on /v1/images/generations and /v1/images/edits (not chat/responses image input)
 #           input-modalities: [text, image] # optional: declare /v1/chat/completions and /v1/responses multimodal input for Codex clients. Use [text] for upstreams that reject multimodal tool result content.
 #           output-modalities: [text]       # optional: declare output modalities when known
@@ -1179,6 +1200,8 @@ plugins:
 # Old spellings shown for reference:
 #   host: ""                         # now server.host
 #   port: 8317                       # now server.port
+#   request-limits: {}                # now server.request-limits (custom gateway safeguards)
+#   outbound-transport: {}            # now requests.outbound-transport (custom gateway safeguards)
 #   remote-management:               # now management
 #     allow-remote: false
 #     secret-key: ""

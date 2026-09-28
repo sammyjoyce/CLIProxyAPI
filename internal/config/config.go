@@ -53,6 +53,13 @@ type Config struct {
 	// CommercialMode disables high-overhead request logging and HTTP middleware features to minimize per-request memory usage.
 	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
 
+	// RequestLimits bounds concurrent proxy requests and the number allowed to wait for capacity.
+	// Zero values disable the corresponding limit.
+	RequestLimits RequestLimitsConfig `yaml:"request-limits" json:"request-limits"`
+
+	// OutboundTransport configures connection establishment for provider requests.
+	OutboundTransport OutboundTransportConfig `yaml:"outbound-transport" json:"outbound-transport"`
+
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
 	LoggingToFile bool `yaml:"logging-to-file" json:"logging-to-file"`
 
@@ -193,4 +200,21 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// RequestLimitsConfig controls admission to proxy endpoints before request bodies are read.
+type RequestLimitsConfig struct {
+	MaxConcurrent           int `yaml:"max-concurrent" json:"max-concurrent"`
+	MaxWebsocketConnections int `yaml:"max-websocket-connections" json:"max-websocket-connections"`
+	MaxQueued               int `yaml:"max-queued" json:"max-queued"`
+	QueueTimeoutSeconds     int `yaml:"queue-timeout-seconds" json:"queue-timeout-seconds"`
+}
+
+// OutboundTransportConfig controls outbound connection establishment and failure backoff.
+// These timeouts end once a provider connection has been established.
+type OutboundTransportConfig struct {
+	ConnectTimeoutSeconds         int `yaml:"connect-timeout-seconds" json:"connect-timeout-seconds"`
+	TLSHandshakeTimeoutSeconds    int `yaml:"tls-handshake-timeout-seconds" json:"tls-handshake-timeout-seconds"`
+	CircuitBreakerFailures        int `yaml:"circuit-breaker-failures" json:"circuit-breaker-failures"`
+	CircuitBreakerCooldownSeconds int `yaml:"circuit-breaker-cooldown-seconds" json:"circuit-breaker-cooldown-seconds"`
 }
