@@ -76,3 +76,38 @@ func joinModalities(modalities []string) string {
 	}
 	return out
 }
+
+func TestBuildOpenAICompatibilityConfigModels_CapacityAndEmptyThinking(t *testing.T) {
+	compat := &config.OpenAICompatibility{
+		Name: "zai",
+		Models: []config.OpenAICompatibilityModel{
+			{
+				Name:                "glm-5.3",
+				Alias:               "glm-5.3",
+				DisplayName:         "GLM-5.3",
+				MaxContextLength:    1000000,
+				MaxCompletionTokens: 131072,
+				InputModalities:     []string{"text"},
+				Thinking:            &registry.ThinkingSupport{Levels: []string{}},
+			},
+		},
+	}
+
+	models := buildOpenAICompatibilityConfigModels(compat)
+	if len(models) != 1 {
+		t.Fatalf("model count = %d, want 1", len(models))
+	}
+	model := models[0]
+	if model.ContextLength != 1000000 || model.MaxContextLength != 1000000 {
+		t.Fatalf("context = %d/%d, want 1000000", model.ContextLength, model.MaxContextLength)
+	}
+	if model.MaxCompletionTokens != 131072 {
+		t.Fatalf("MaxCompletionTokens = %d, want 131072", model.MaxCompletionTokens)
+	}
+	if model.Thinking == nil {
+		t.Fatal("expected non-nil thinking after empty levels")
+	}
+	if len(model.Thinking.Levels) != 0 {
+		t.Fatalf("thinking levels = %+v, want empty", model.Thinking.Levels)
+	}
+}

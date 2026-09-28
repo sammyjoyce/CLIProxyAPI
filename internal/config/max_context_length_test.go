@@ -84,3 +84,45 @@ openai-compatibility:
 		})
 	}
 }
+
+func TestMaxCompletionTokensConfigDecoding(t *testing.T) {
+	const want = 131072
+	const yamlConfig = `openai-compatibility:
+  - models:
+      - name: glm-5.3
+        alias: glm-5.3
+        max-completion-tokens: 131072
+`
+	const jsonConfig = `{"openai-compatibility":[{"models":[{"name":"glm-5.3","alias":"glm-5.3","max-completion-tokens":131072}]}]}`
+
+	for _, testCase := range []struct {
+		name   string
+		decode func(*Config) error
+	}{
+		{
+			name: "YAML",
+			decode: func(cfg *Config) error {
+				return yaml.Unmarshal([]byte(yamlConfig), cfg)
+			},
+		},
+		{
+			name: "JSON",
+			decode: func(cfg *Config) error {
+				return json.Unmarshal([]byte(jsonConfig), cfg)
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var cfg Config
+			if errDecode := testCase.decode(&cfg); errDecode != nil {
+				t.Fatalf("decode config: %v", errDecode)
+			}
+			if len(cfg.OpenAICompatibility) != 1 || len(cfg.OpenAICompatibility[0].Models) != 1 {
+				t.Fatalf("unexpected compat models: %+v", cfg.OpenAICompatibility)
+			}
+			if got := cfg.OpenAICompatibility[0].Models[0].MaxCompletionTokens; got != want {
+				t.Fatalf("MaxCompletionTokens = %d, want %d", got, want)
+			}
+		})
+	}
+}

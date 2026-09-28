@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/zstd"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -278,14 +279,18 @@ func shouldSkipMethodForRequestLogging(req *http.Request) bool {
 	return !isResponsesWebsocketUpgrade(req)
 }
 
+// isResponsesWebsocketUpgrade reports whether req upgrades to the downstream
+// route served by the Responses websocket handler. Request logging attaches its
+// websocket timeline capture only there; the admission limiter classifies the
+// wider set of registered upgrade routes separately.
 func isResponsesWebsocketUpgrade(req *http.Request) bool {
-	if req == nil || req.URL == nil {
+	if req == nil || req.URL == nil || req.Method != http.MethodGet {
 		return false
 	}
 	if req.URL.Path != "/v1/responses" && req.URL.Path != "/backend-api/codex/responses" {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(req.Header.Get("Upgrade")), "websocket")
+	return websocket.IsWebSocketUpgrade(req)
 }
 
 func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {

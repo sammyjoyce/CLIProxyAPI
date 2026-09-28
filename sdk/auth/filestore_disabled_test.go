@@ -3,10 +3,16 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/empty"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
@@ -60,6 +66,124 @@ func TestFileTokenStore_Save_DisabledPersistsFlagForTokenStorage(t *testing.T) {
 	}
 	if disabled, _ := meta["disabled"].(bool); !disabled {
 		t.Fatalf("disabled=%v, want true (raw=%s)", meta["disabled"], string(raw))
+	}
+}
+
+func TestFileTokenStore_Save_HydratesMetadataFromTokenStorageFile(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		metadata map[string]any
+	}{
+		{name: "nil metadata"},
+		{name: "hook metadata", metadata: map[string]any{
+			"email": "alias@example.com", "timestamp": int64(1<<53 + 1),
+			"headers": map[string]string{"X-Test": "value"},
+			"empty":   "", "false": false, "null": nil,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewFileTokenStore()
+			store.SetBaseDir(t.TempDir())
+			auth := &cliproxyauth.Auth{
+				ID: "claude-account.json", Provider: "claude", Metadata: tc.metadata,
+				Storage: &claudeauth.ClaudeTokenStorage{
+					AccessToken: "test-access-token", RefreshToken: "test-refresh-token",
+					Email: "account@example.com", Expire: "2026-08-18T18:30:31Z", LastRefresh: "2026-08-18T10:30:32Z",
+				},
+			}
+			want := map[string]any{
+				"access_token": "test-access-token", "refresh_token": "test-refresh-token",
+				"type": "claude", "email": "account@example.com", "disabled": false,
+				"expired": "2026-08-18T18:30:31Z", "last_refresh": "2026-08-18T10:30:32Z",
+			}
+			maps.Copy(want, tc.metadata)
+			path, errSave := store.Save(t.Context(), auth)
+			if errSave != nil {
+				t.Fatal(errSave)
+			}
+			for key, value := range want {
+				if got, exists := auth.Metadata[key]; !exists || !reflect.DeepEqual(got, value) {
+					t.Errorf("metadata %q was not hydrated or its existing value/type changed", key)
+				}
+			}
+			if tc.metadata != nil && tc.metadata["access_token"] != want["access_token"] {
+				t.Fatal("hydration replaced rather than updated the metadata map")
+			}
+			if auth.Attributes[cliproxyauth.AttributePath] != path || auth.FileName != auth.ID {
+				t.Fatal("Save did not finish populating file identity")
+			}
+			// Runtime metadata remains authoritative over the original login storage.
+			auth.Metadata["access_token"] = "test-refreshed-token"
+			if _, errSave = store.Save(t.Context(), auth); errSave != nil {
+				t.Fatal(errSave)
+			}
+			raw, errRead := os.ReadFile(path)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			var persisted map[string]any
+			if err := json.Unmarshal(raw, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if persisted["access_token"] != "test-refreshed-token" || auth.Metadata["access_token"] != persisted["access_token"] {
+				t.Fatal("repeated Save lost the runtime token update")
+			}
+		})
+	}
+}
+
+func TestFileTokenStore_Save_HydrationAllowsNoOpStorage(t *testing.T) {
+	store := NewFileTokenStore()
+	store.SetBaseDir(t.TempDir())
+	auth := &cliproxyauth.Auth{ID: "empty.json", Storage: &empty.EmptyStorage{}}
+	path, err := store.Save(t.Context(), auth)
+	if err != nil {
+		t.Fatalf("no-op storage Save failed: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("no-op storage unexpectedly created a file: %v", err)
+	}
+}
+
+type fileTokenStorageFunc func(string) error
+
+func (f fileTokenStorageFunc) SaveTokenToFile(path string) error { return f(path) }
+
+func TestFileTokenStore_Save_HydrationFailuresDoNotMergeMetadata(t *testing.T) {
+	writeFailure := errors.New("test save failure")
+	for _, tc := range []struct {
+		name    string
+		storage fileTokenStorageFunc
+		wantErr string
+	}{
+		{"save failure", func(string) error { return writeFailure }, "test save failure"},
+		{"read failure", func(path string) error { return os.Mkdir(path, 0o700) }, "reread persisted file failed"},
+		{"empty file", func(path string) error { return os.WriteFile(path, nil, 0o600) }, ""},
+		{"invalid JSON", func(path string) error {
+			return os.WriteFile(path, []byte(`{"access_token":"partial-test-token","broken":`), 0o600)
+		}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewFileTokenStore()
+			store.SetBaseDir(t.TempDir())
+			auth := &cliproxyauth.Auth{ID: "failure.json", Storage: tc.storage, Metadata: map[string]any{"timestamp": int64(42)}}
+			_, err := store.Save(t.Context(), auth)
+			if tc.wantErr == "" {
+				// Hydration is best-effort: a file that cannot be unmarshaled must not
+				// fail a Save that already wrote it successfully.
+				if err != nil {
+					t.Fatalf("Save error = %v, want nil for unmarshalable persisted file", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Save error = %v, want %q", err, tc.wantErr)
+			}
+			if tc.name == "save failure" && !errors.Is(err, writeFailure) {
+				t.Fatal("Save lost the original storage error")
+			}
+			if _, exists := auth.Metadata["access_token"]; exists || auth.Metadata["timestamp"] != int64(42) {
+				t.Fatal("failed hydration partially changed metadata")
+			}
+		})
 	}
 }
 

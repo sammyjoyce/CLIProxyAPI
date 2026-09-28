@@ -280,7 +280,7 @@ func convertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				if len(relayedToolImages) > 0 {
 					relayItems := make([][]byte, 0, len(relayedToolImages)+1)
 					noticeJSON := []byte(`{"type":"text","text":""}`)
-					noticeJSON, _ = sjson.SetBytes(noticeJSON, "text", toolResultImageRelayNotice)
+					noticeJSON, _ = sjson.SetBytes(noticeJSON, "text", ToolResultImageRelayNotice)
 					relayItems = append(relayItems, noticeJSON)
 					relayItems = append(relayItems, relayedToolImages...)
 
@@ -566,8 +566,11 @@ func convertClaudeContentPart(part gjson.Result) (string, bool) {
 // tool_result carried nothing but images.
 const toolResultImagePlaceholder = "[Tool returned image content; the images follow in the next user message.]"
 
-// toolResultImageRelayNotice labels the user message that carries relayed tool images.
-const toolResultImageRelayNotice = "Images returned by the preceding tool call(s):"
+// ToolResultImageRelayNotice labels the user message that carries tool-result
+// images relayed out of an OpenAI tool message. The text-only normalizer in
+// internal/runtime/executor/helps matches this notice to replace those images
+// for upstreams that exclude image input.
+const ToolResultImageRelayNotice = "Images returned by the preceding tool call(s):"
 
 func convertClaudeToolResultContent(content gjson.Result) (string, [][]byte) {
 	if !content.Exists() {

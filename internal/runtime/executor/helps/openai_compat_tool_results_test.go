@@ -249,3 +249,34 @@ func TestShouldNormalizeOpenAIToolResultsForModel(t *testing.T) {
 		t.Fatal("nil compatibility config unexpectedly enabled normalization")
 	}
 }
+
+// TestNormalizeOpenAIToolResultsTextOnlyLeavesNonRelayPayloadsUntouched pins the
+// guard rails of the relay stripping: payloads without a relay notice plus image
+// parts must survive normalization byte-for-byte.
+func TestNormalizeOpenAIToolResultsTextOnlyLeavesNonRelayPayloadsUntouched(t *testing.T) {
+	image := `{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}`
+
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "user images without the relay notice are untouched",
+			input: `{"messages":[{"role":"user","content":[` + image + `,{"type":"text","text":"describe this"}]}]}`,
+		},
+		{
+			name:  "relay notice without images is untouched",
+			input: `{"messages":[{"role":"user","content":[{"type":"text","text":"` + claudeToolResultImageRelayNotice + `"}]}]}`,
+		},
+		{
+			name:  "payload without relayed images is untouched",
+			input: `{"messages":[{"role":"assistant","content":[{"type":"text","text":"hi"}]},{"role":"user","content":[{"type":"text","text":"hello"}]}],"model":"m"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeOpenAIToolResultsTextOnly([]byte(tc.input)); string(got) != tc.input {
+				t.Fatalf("payload changed: %s", got)
+			}
+		})
+	}
+}

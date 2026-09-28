@@ -49,55 +49,107 @@
 // double-layer (R) encodings are supported. Historical cache-mode modelGroup#
 // prefixes are stripped.
 //
-// # CAIS envelope (newest Claude Code models)
+// # CAIS envelopes (newer Claude Code models)
 //
 // Newer Claude Code models wrap the channel block in a CAIS envelope whose
 // decoded payload starts with 0x08 (top-level field 1 varint) instead of 0x12,
-// so the base64 string starts with 'C' instead of 'E'/'R'. The envelope version
-// varint in top-level field 1 is the ONLY structural difference from the layout
-// above; everything below it is unchanged.
+// so the base64 string starts with 'C' instead of 'E'/'R'. For the model-tagged
+// generation, the envelope version varint in top-level field 1 is the only
+// structural difference from the classic layout above; everything below it is
+// unchanged.
 //
-// The channel block itself belongs to a newer schema generation that is shared
-// by both envelopes: channel_id 16, no infra field 2, plus a block kind (field
-// 8) and a context id (field 11). Observed traffic confirms this schema
-// appears under the classic 0x12 envelope too (opus-4-6/4-7/4-8, sonnet-5) and
-// under the CAIS envelope (opus-5, fable-5), so envelope form and channel schema
-// generation vary independently and must not be inferred from each other:
+// The model-tagged channel generation is shared by both envelopes: channel_id
+// 16, no infra field 2, plus a block kind (field 8) and a context id (field 11).
+// Observed traffic confirms this schema appears under the classic 0x12 envelope
+// (opus-4-6/4-7/4-8, sonnet-5) and the CAIS envelope (opus-5, fable-5), so
+// envelope form and channel schema generation vary independently and must not be
+// inferred from each other:
 //
-//	Top-level protobuf
+//	Model-tagged CAIS protobuf
 //	|- Field 1 (varint): envelope version [required marker, observed as 2]
 //	|- Field 2 (bytes): container [required]
-//	|  `- Field 1 (bytes): channel block [required]
-//	|     |- Field 1  (varint): channel_id [required, observed as 16]
-//	|     |- Field 3  (varint): version [optional, observed as 2]
-//	|     |- Field 5  (bytes):  ECDSA signature [required, observed as 64B]
-//	|     |- Field 6  (bytes):  model_text [required, "claude-" prefixed]
-//	|     |- Field 7  (varint): unknown [optional, observed as 1]
-//	|     |- Field 8  (bytes):  block kind [optional, observed as "thinking"]
-//	|     `- Field 11 (bytes):  context id [optional, canonical UUID]
+//	|  |- Field 1 (bytes): channel block [required]
+//	|  |  |- Field 1  (varint): channel_id [required, observed as 16]
+//	|  |  |- Field 3  (varint): version [optional, observed as 2]
+//	|  |  |- Field 5  (bytes):  opaque signature bytes [required, observed as 64B]
+//	|  |  |- Field 6  (bytes):  model_text [required, "claude-" prefixed]
+//	|  |  |- Field 7  (varint): unknown [optional, observed as 1]
+//	|  |  |- Field 8  (bytes):  block kind [optional, observed as "thinking"]
+//	|  |  `- Field 11 (bytes):  context id [optional, canonical UUID]
+//	|  |- Field 2 (bytes): nonce [observed as 12B, not required]
+//	|  |- Field 3 (bytes): session [observed as 12B, not required]
+//	|  |- Field 4 (bytes): digest [observed as 48B, not required]
+//	|  `- Field 5 (bytes): opaque carrier [observed non-empty, not required]
 //	`- Field 3 (varint): trailer [optional, observed as 1]
+//
+// The model-free generation keeps the same outer container wire layout but
+// removes the two channel fields that carried signature bytes and model text.
+// Its opaque carrier remains in container field 5. Independent captures of both
+// generations corroborate the same field-1 channel spine, 12/12/48 field widths,
+// and non-empty field 5; the widths remain descriptive rather than load-bearing:
+//
+//	Model-free CAIS protobuf
+//	|- Field 1 (varint): envelope version [required, known generation set]
+//	|- Field 2 (bytes): container [required]
+//	|  |- Field 1 (bytes): channel block [required]
+//	|  |  |- Field 1  (varint): channel_id [required, known generation set]
+//	|  |  |- Field 3  (varint): version [optional]
+//	|  |  |- Field 5  (bytes):  ABSENT
+//	|  |  |- Field 6  (bytes):  ABSENT
+//	|  |  |- Field 7  (varint): unknown [optional]
+//	|  |  |- Field 8  (bytes):  block kind [optional]
+//	|  |  `- Field 11 (bytes):  context id [optional, canonical UUID]
+//	|  |- Field 2 (bytes): nonce [observed as 12B, not required]
+//	|  |- Field 3 (bytes): session [observed as 12B, not required]
+//	|  |- Field 4 (bytes): digest [observed as 48B, not required]
+//	|  `- Field 5 (bytes): opaque signing carrier [required, non-empty]
+//	`- Field 3 (varint): trailer [optional]
 //
 // CAIS validation is structural rather than an exact replay of the observed
 // bytes. The payload is an opaque upstream-issued blob and rejecting it drops
-// the whole thinking block, so only the fields that actually identify the format
-// are required: the 0x08 marker, the nested container/channel block, the
-// signature bytes, and (for EnvelopeVersion < 4) the "claude-" model text. Observed-but-incidental values
-// such as channel_id 16/17 are recorded for debugging.
+// the whole thinking block. Model-tagged envelopes retain their literal
+// "claude-" classification marker. Model-free envelopes instead require the
+// complete container/channel tree, absent channel fields 5 and 6, a non-empty
+// container field 5 carrier, and known envelope/channel generation identifiers.
+// Observed-but-incidental channel-version, field-7, and trailer values are
+// checked only for wire type, so an upstream value bump cannot silently erase
+// conversation history. Block kind combines both policies deliberately: an
+// omitted channel field 8 is not a defect, legacy generations accept any
+// well-formed UTF-8 kind, and a CAQS generation (envelope version >= 4, e.g.
+// claude-fable-5-1) accepts the kinds its signatures are known to carry --
+// "thinking" and "narration" from CAQS captures, plus "tool_use", which the
+// model-free compatibility corpus pins. An explicitly present unrecognized kind
+// on a CAQS generation is therefore rejected while an absent one is not.
 //
-// In EnvelopeVersion >= 4 (CAQS, e.g. claude-fable-5-1 / claude-fable-5-1-max),
-// signature bytes are located in Container Field 5 (Field 2.5), plaintext model_text
-// is omitted, and block kind supports both "thinking" and "narration".
+// This parser performs no cryptographic verification. The model-tagged branch
+// checks only that opaque signature bytes and the model marker are present, and
+// the model-free branch is likewise a narrow syntactic heuristic. No
+// payload-only discriminator for model-free CAIS is both generation-stable and
+// provider-distinguishing. Proof of origin requires trusted provenance from the
+// response path or cache envelope, so this result must never be treated as
+// authentication. Measured adversarial controls for the predicate that ships:
+//
+//	uniform-random, first byte forced 0x08       n=1,000,000  shipped=0      spine-only=0
+//	random well-formed protobuf, 0x08 first      n=1,000,000  shipped=0      spine-only=25
+//	spine-shaped, identifiers randomised         n=200,000    shipped=4,754  (the {2,4}x{16,17} product)
+//	spine-shaped, exactly one identifier bumped  n=200,000    shipped=0
+//
+// The allowlist earns the small measured exclusion over the bare structure in
+// the second row. The last row is its residual cost: a future identifier bump
+// drops signed history until the list is amended. The executor emits that event
+// at operator-visible warning severity with the rejected identifier. Gemini and
+// GPT are unreachable here by their 0x12 and 0x80 envelope markers; Kimi and
+// Grok have no protobuf tree.
 //
 // # Which provider emits which envelope
 //
 // Three providers serve Claude models, and the envelope depends on the model
 // generation rather than on the provider:
 //
-//   - Claude Code OAuth subscription (Claude Code Max): opus-4-5, sonnet-4-6 and
-//     every later model up to opus-5 and fable-5. Emits the CAIS envelope for
-//     the newest models (opus-5, fable-5) and the single-layer E envelope for the
-//     opus-4-6/4-7/4-8 and sonnet-5 generation — but both carry the same
-//     channel_id 16 channel schema, so only the envelope differs.
+//   - Claude Code OAuth subscription (Claude Code Max): opus-4-5, sonnet-4-6,
+//     and later models. Opus-5 and fable-5 emit model-tagged CAIS, fable-5-1
+//     emits model-free CAIS, and the opus-4-6/4-7/4-8 and sonnet-5 generation
+//     emits the single-layer E envelope.
 //   - Claude Messages API: the full Claude model range, same envelopes as the
 //     Claude Code OAuth subscription.
 //   - Antigravity: only opus-4-6-think and sonnet-4-6, and always the
@@ -114,6 +166,7 @@ package signature
 import (
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -578,13 +631,44 @@ func decodeClaudeBytesField(raw []byte, label string) ([]byte, error) {
 	return value, nil
 }
 
-// claudeCAISSignatureMarker is the decoded first byte identifying the CAIS
-// envelope (protobuf tag for top-level field 1, varint).
-const claudeCAISSignatureMarker = 0x08
+const (
+	// claudeCAISSignatureMarker is the decoded first byte identifying the CAIS
+	// envelope (protobuf tag for top-level field 1, varint).
+	claudeCAISSignatureMarker = 0x08
 
-// claudeCAISModelTextPrefix is the model_text prefix that distinguishes a CAIS
-// channel block from an arbitrary protobuf payload.
-const claudeCAISModelTextPrefix = "claude-"
+	// claudeCAISModelTextPrefix is the model_text prefix that distinguishes a
+	// model-tagged CAIS channel block from an arbitrary protobuf payload.
+	claudeCAISModelTextPrefix = "claude-"
+)
+
+// Model-free CAIS envelopes use explicit known-generation allowlists in
+// addition to the structural spine. This is release bookkeeping, not
+// cryptographic verification or the source of cross-provider separation. The
+// two lists deliberately form a Cartesian product. This policy allows the two
+// separately versioned protobuf layers to roll independently; pair-locking would
+// instead drop signed history during a staggered rollout. It accepts combinations
+// not yet seen in a model-free capture, but only when both identifiers are
+// independently observed CAIS generations and the complete model-free spine is
+// present. When Anthropic
+// adds a generation, confirm its complete protobuf tree against captures, then
+// add its envelope version or channel id here. Channel id 11 is intentionally
+// absent because it has only been observed under the legacy 0x12 envelope, never
+// under CAIS.
+var (
+	knownClaudeCAISEnvelopeVersions = [...]uint64{2, 4}
+	knownClaudeCAISChannelIDs       = [...]uint64{16, 17}
+)
+
+// ClaudeCAISUnknownGenerationError identifies a structurally valid model-free
+// CAIS signature whose envelope version or channel ID is not yet recognized.
+type ClaudeCAISUnknownGenerationError struct {
+	identifier string
+	value      uint64
+}
+
+func (e *ClaudeCAISUnknownGenerationError) Error() string {
+	return fmt.Sprintf("invalid Claude model-free CAIS signature: unknown %s %d", e.identifier, e.value)
+}
 
 // ClaudeCAISSignatureInfo describes the locally inspected structure of a Claude
 // CAIS thinking signature.
@@ -599,16 +683,18 @@ type ClaudeCAISSignatureInfo struct {
 	SignatureLen int
 }
 
-// IsValidClaudeCAISSignature returns whether rawSignature is a valid Claude CAIS
-// thinking signature.
+// IsValidClaudeCAISSignature reports whether rawSignature has a recognized
+// Claude CAIS thinking-signature format. It does not verify cryptographic
+// authenticity.
 func IsValidClaudeCAISSignature(rawSignature string) bool {
 	_, err := InspectClaudeCAISSignature(rawSignature)
 	return err == nil
 }
 
-// InspectClaudeCAISSignature decodes and validates a Claude CAIS thinking
-// signature. See the CAIS envelope section in this file's package comment for
-// the layout and for why validation is structural rather than exact.
+// InspectClaudeCAISSignature decodes and classifies a Claude CAIS thinking
+// signature syntactically. See the CAIS envelope section in this file's package
+// comment for the layout and for why recognition is structural rather than
+// exact. This function does not verify cryptographic authenticity.
 func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, error) {
 	sig := stripClaudeSignaturePrefix(rawSignature)
 	if sig == "" {
@@ -639,7 +725,7 @@ func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, 
 	info := &ClaudeCAISSignatureInfo{FirstByte: decoded[0]}
 
 	var container []byte
-	var containerSignatureBytes []byte
+	var haveEnvelopeVersion bool
 	err = walkClaudeProtobufFields(decoded, func(num protowire.Number, typ protowire.Type, raw []byte) error {
 		switch num {
 		case 1:
@@ -648,6 +734,7 @@ func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, 
 				return errField
 			}
 			info.EnvelopeVersion = value
+			haveEnvelopeVersion = true
 		case 2:
 			value, errField := decodeClaudeCAISBytes(raw, typ, "CAIS top-level field 2 container")
 			if errField != nil {
@@ -668,7 +755,9 @@ func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, 
 		return nil, fmt.Errorf("invalid Claude CAIS signature: missing top-level field 2 container")
 	}
 
-	var channelBlock []byte
+	var channelBlock, containerCarrier []byte
+	var containerCarrierType protowire.Type
+	var haveContainerCarrier bool
 	err = walkClaudeProtobufFields(container, func(num protowire.Number, typ protowire.Type, raw []byte) error {
 		switch num {
 		case 1:
@@ -678,11 +767,15 @@ func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, 
 			}
 			channelBlock = value
 		case 5:
-			value, errField := decodeClaudeCAISBytes(raw, typ, "CAIS container field 5 signature bytes")
-			if errField != nil {
-				return errField
+			haveContainerCarrier = true
+			containerCarrierType = typ
+			if typ == protowire.BytesType {
+				value, errField := decodeClaudeBytesField(raw, "CAIS container field 5 carrier")
+				if errField != nil {
+					return errField
+				}
+				containerCarrier = value
 			}
-			containerSignatureBytes = value
 		}
 		return nil
 	})
@@ -693,7 +786,7 @@ func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, 
 		return nil, fmt.Errorf("invalid Claude CAIS signature: missing container field 1 channel block")
 	}
 
-	var haveChannelID, haveSignatureBytes, haveModelText bool
+	var haveChannelID, haveSignatureBytes, haveModelText, haveBlockKind bool
 	err = walkClaudeProtobufFields(channelBlock, func(num protowire.Number, typ protowire.Type, raw []byte) error {
 		switch num {
 		case 1:
@@ -737,6 +830,7 @@ func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, 
 				return errField
 			}
 			info.BlockKind = value
+			haveBlockKind = true
 		case 11:
 			value, errField := decodeClaudeCAISUTF8(raw, typ, "CAIS channel field 11 context id")
 			if errField != nil {
@@ -752,22 +846,78 @@ func InspectClaudeCAISSignature(rawSignature string) (*ClaudeCAISSignatureInfo, 
 	if err != nil {
 		return nil, err
 	}
-	if !haveSignatureBytes && info.EnvelopeVersion >= 4 && len(containerSignatureBytes) > 0 {
-		info.SignatureLen = len(containerSignatureBytes)
-		haveSignatureBytes = true
-	}
-	switch {
-	case !haveChannelID:
+	if !haveChannelID {
 		return nil, fmt.Errorf("invalid Claude CAIS signature: missing channel field 1 channel_id")
-	case !haveSignatureBytes:
-		return nil, fmt.Errorf("invalid Claude CAIS signature: missing signature bytes")
-	case !haveModelText && info.EnvelopeVersion < 4:
-		return nil, fmt.Errorf("invalid Claude CAIS signature: missing channel field 6 model_text")
-	case info.EnvelopeVersion >= 4 && info.BlockKind != "thinking" && info.BlockKind != "narration":
-		return nil, fmt.Errorf("invalid Claude CAQS signature: expected block kind \"thinking\" or \"narration\", got %q", info.BlockKind)
 	}
 
+	// Model-tagged CAIS keeps its established syntactic classifier: non-empty
+	// opaque signature bytes plus claude-prefixed model text. Neither field is
+	// cryptographically verified, so callers must not treat recognition as proof.
+	if haveSignatureBytes || haveModelText {
+		if !haveSignatureBytes {
+			// Envelope version >= 4 (CAQS) relocates the opaque signature bytes to
+			// container field 5 and omits model_text.
+			if info.EnvelopeVersion >= 4 && containerCarrierType == protowire.BytesType && len(containerCarrier) > 0 {
+				info.SignatureLen = len(containerCarrier)
+			} else {
+				return nil, fmt.Errorf("invalid Claude CAIS signature: missing channel field 5 signature bytes")
+			}
+		}
+		if !haveModelText && info.EnvelopeVersion < 4 {
+			return nil, fmt.Errorf("invalid Claude CAIS signature: missing channel field 6 model_text")
+		}
+		if errBlockKind := validateClaudeCAQSBlockKind(info, haveBlockKind); errBlockKind != nil {
+			return nil, errBlockKind
+		}
+		return info, nil
+	}
+
+	// Model-free CAIS has no provider literal. Require its moved carrier and both
+	// known generation identifiers, while retaining the model-tagged sibling's
+	// tolerance for incidental varint values and optional fields. The carrier is
+	// validated before the generation identifiers so malformed input never
+	// reports as an unknown generation.
+	switch {
+	case !haveEnvelopeVersion:
+		return nil, fmt.Errorf("invalid Claude model-free CAIS signature: missing envelope version")
+	case !haveContainerCarrier:
+		return nil, fmt.Errorf("invalid Claude model-free CAIS signature: missing container field 5 carrier")
+	case containerCarrierType != protowire.BytesType:
+		return nil, fmt.Errorf("invalid Claude model-free CAIS signature: container field 5 carrier must be bytes")
+	case len(containerCarrier) == 0:
+		return nil, fmt.Errorf("invalid Claude model-free CAIS signature: container field 5 carrier must not be empty")
+	case !slices.Contains(knownClaudeCAISEnvelopeVersions[:], info.EnvelopeVersion):
+		return nil, &ClaudeCAISUnknownGenerationError{identifier: "envelope version", value: info.EnvelopeVersion}
+	case !slices.Contains(knownClaudeCAISChannelIDs[:], info.ChannelID):
+		return nil, &ClaudeCAISUnknownGenerationError{identifier: "channel_id", value: info.ChannelID}
+	}
+	if errBlockKind := validateClaudeCAQSBlockKind(info, haveBlockKind); errBlockKind != nil {
+		return nil, errBlockKind
+	}
+	// The relocated carrier is this generation's signature bytes, so callers see
+	// the same signature length they see for a model-tagged envelope.
+	info.SignatureLen = len(containerCarrier)
+
 	return info, nil
+}
+
+// claudeCAQSBlockKinds are the channel block kinds a CAQS generation (envelope
+// version >= 4) may declare. Channel field 8 is optional, so an omitted kind is
+// not a defect; an explicitly present value must be one of these.
+var claudeCAQSBlockKinds = [...]string{"thinking", "narration", "tool_use"}
+
+// validateClaudeCAQSBlockKind applies the block-kind contract for the envelope
+// generation in use. CAQS (envelope version >= 4) may omit the optional block
+// kind, but a value it does supply must be a kind these signatures are known to
+// carry: "thinking" and "narration" were observed in CAQS captures, and
+// "tool_use" is pinned by the model-free compatibility corpus. Legacy
+// generations are unchanged and keep their tolerance for any well-formed UTF-8
+// kind, because an upstream value bump there must not erase signed history.
+func validateClaudeCAQSBlockKind(info *ClaudeCAISSignatureInfo, haveBlockKind bool) error {
+	if info.EnvelopeVersion < 4 || !haveBlockKind || slices.Contains(claudeCAQSBlockKinds[:], info.BlockKind) {
+		return nil
+	}
+	return fmt.Errorf("invalid Claude CAQS signature: expected block kind \"thinking\", \"narration\" or \"tool_use\", got %q", info.BlockKind)
 }
 
 func decodeClaudeCAISVarint(raw []byte, typ protowire.Type, label string) (uint64, error) {

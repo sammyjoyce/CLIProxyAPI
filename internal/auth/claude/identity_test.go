@@ -6,6 +6,23 @@ import (
 	"testing"
 )
 
+func TestReadMetadataBool(t *testing.T) {
+	var absent map[string]any
+	if ReadMetadataBool(nil, "flag") || ReadMetadataBool(&absent, "flag") || absent != nil {
+		t.Fatal("reading absent metadata must return false without initializing it")
+	}
+	for _, value := range []any{true, false, "true", 1, nil} {
+		metadata := map[string]any{"flag": value}
+		want, _ := value.(bool)
+		if got := ReadMetadataBool(&metadata, "flag"); got != want {
+			t.Errorf("ReadMetadataBool(%#v) = %v, want %v", value, got, want)
+		}
+		if ReadMetadataBool(&metadata, "missing") {
+			t.Fatal("missing flag must return false")
+		}
+	}
+}
+
 func TestGenerateDeviceIDPool(t *testing.T) {
 	deviceIDs, errGenerate := GenerateDeviceIDPool()
 	if errGenerate != nil {

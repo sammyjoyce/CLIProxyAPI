@@ -106,6 +106,12 @@ func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) b
 	if oldCfg == nil || oldCfg.TransientErrorCooldownSeconds != cfg.TransientErrorCooldownSeconds {
 		auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 	}
+	if cfg.RequestLimits != s.activeRequestLimits {
+		log.WithFields(log.Fields{
+			"active_request_limits":    s.activeRequestLimits,
+			"requested_request_limits": cfg.RequestLimits,
+		}).Warn("changes to request-limits are not applied by hot reload; restart the process to apply them")
+	}
 
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
 		log.Infof("disable-image-generation updated: %v -> %v", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)

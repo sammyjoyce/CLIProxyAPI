@@ -35,6 +35,7 @@ const (
 	wsTurnStateHeader                     = "x-codex-turn-state"
 	wsTimelineBodyKey                     = "WEBSOCKET_TIMELINE_OVERRIDE"
 	wsCloseReasonMaxBytes                 = 123
+	wsDownstreamReadLimit                 = 64 << 20 // 64 MiB per downstream message
 	wsHTTPReplayRequiredCloseReason       = "upstream requires HTTP replay"
 	responsesWebsocketUpstreamModeUnknown = ""
 	responsesWebsocketUpstreamModeWS      = "websocket"
@@ -262,6 +263,29 @@ func truncateWebsocketCloseReason(reason string, maxBytes int) string {
 	return truncated.String()
 }
 
+type responsesWebsocketReadResult struct {
+	messageType int
+	payload     []byte
+}
+
+func nextResponsesWebsocketReadResult(ctx context.Context, readResults <-chan responsesWebsocketReadResult) (responsesWebsocketReadResult, bool) {
+	if ctx == nil {
+		readResult, ok := <-readResults
+		return readResult, ok
+	}
+	select {
+	case <-ctx.Done():
+		return responsesWebsocketReadResult{}, false
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return responsesWebsocketReadResult{}, false
+	case readResult, ok := <-readResults:
+		return readResult, ok
+	}
+}
+
 // ResponsesWebsocket handles websocket requests for /v1/responses.
 // It accepts `response.create` and `response.append` requests and streams
 // response events back as JSON websocket text messages.
@@ -270,14 +294,23 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	// Bound the downstream per-message read size before the reader goroutine
+	// starts so a single oversized client message cannot exhaust memory.
+	conn.SetReadLimit(wsDownstreamReadLimit)
+	writer := newResponsesWebsocketWriter(conn)
+	downstreamCtx, cancelDownstream := context.WithCancelCause(cliproxyexecutor.WithDownstreamWebsocket(c.Request.Context()))
+	defer cancelDownstream(nil)
+	c.Request = c.Request.WithContext(downstreamCtx)
+
+	// Steering and the bounded legacy path must never run concurrent readers
+	// against the same downstream WebSocket.
 	var duplexInput <-chan cliproxyexecutor.WebsocketInput
 	if h != nil && h.Cfg != nil && h.Cfg.CodexResponseSteering {
-		socketCtx, cancelSocket := context.WithCancel(c.Request.Context())
-		defer cancelSocket()
-		c.Request = c.Request.WithContext(socketCtx)
-		duplexInput = readResponsesWebsocketInput(socketCtx, cancelSocket, conn)
+		duplexInput = readResponsesWebsocketInput(downstreamCtx, func() {
+			cancelDownstream(context.Canceled)
+		}, conn)
 	}
-	writer := newResponsesWebsocketWriter(conn)
+
 	passthroughSessionID := uuid.NewString()
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
@@ -290,6 +323,27 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	wsDone := make(chan struct{})
 	defer close(wsDone)
 	var codexDuplexStream atomic.Bool
+	readResults := make(chan responsesWebsocketReadResult, 1)
+	if duplexInput == nil {
+		go func() {
+			for {
+				// SetReadLimit bounds each message. Only this reader or the duplex
+				// reader runs, so the downstream connection always has one reader.
+				messageType, payload, errRead := conn.ReadMessage()
+				if errRead != nil {
+					cancelDownstream(errRead)
+					return
+				}
+				// Blocking sends bound queued payloads and apply TCP backpressure.
+				// Session teardown releases a reader waiting to hand off a payload.
+				select {
+				case readResults <- responsesWebsocketReadResult{messageType: messageType, payload: payload}:
+				case <-wsDone:
+					return
+				}
+			}
+		}()
+	}
 
 	if h != nil && h.AuthManager != nil {
 		type upstreamDisconnectSubscriber interface {
@@ -408,7 +462,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var payload []byte
 		var errReadMessage error
 		if duplexInput == nil {
-			msgType, payload, errReadMessage = conn.ReadMessage()
+			readResult, ok := nextResponsesWebsocketReadResult(downstreamCtx, readResults)
+			if !ok {
+				wsTerminateErr = context.Cause(downstreamCtx)
+				if websocket.IsCloseError(wsTerminateErr, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+					log.Infof("responses websocket: client disconnected id=%s error=%v", passthroughSessionID, wsTerminateErr)
+				}
+				return
+			}
+			msgType, payload = readResult.messageType, readResult.payload
 		} else {
 			select {
 			case message, ok := <-duplexInput:
@@ -760,6 +822,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		)
 		if errForward != nil {
 			wsTerminateErr = errForward
+			if downstreamCause := context.Cause(c.Request.Context()); downstreamCause != nil {
+				wsTerminateErr = downstreamCause
+			}
 			switch {
 			case errors.Is(errForward, websocket.ErrCloseSent):
 			case isWebsocketConnectionClosedError(errForward):

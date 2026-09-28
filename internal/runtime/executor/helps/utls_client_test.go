@@ -11,190 +11,24 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	tls "github.com/refraction-networking/utls"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 )
 
 type utlsClientRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f utlsClientRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
-}
-
-type trackedReadCloser struct {
-	io.Reader
-	closeCount int
-	closeErr   error
-	onClose    func()
-}
-
-func (r *trackedReadCloser) Close() error {
-	r.closeCount++
-	if r.onClose != nil {
-		r.onClose()
-	}
-	return r.closeErr
-}
-
-type contextDialerFunc func(context.Context, string, string) (net.Conn, error)
-
-func (f contextDialerFunc) Dial(network, addr string) (net.Conn, error) {
-	return f(context.Background(), network, addr)
-}
-
-func (f contextDialerFunc) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return f(ctx, network, addr)
-}
-
-type trackedNetConn struct {
-	net.Conn
-	closeCount atomic.Int32
-}
-
-func (c *trackedNetConn) Close() error {
-	c.closeCount.Add(1)
-	return c.Conn.Close()
-}
-
-func TestCloseConnectionBodyClosesConnectionBeforeBodyOnce(t *testing.T) {
-	bodyErr := errors.New("body close failed")
-	connectionErr := errors.New("connection close failed")
-	var closeOrder []string
-	body := &trackedReadCloser{
-		Reader:   strings.NewReader("response"),
-		closeErr: bodyErr,
-		onClose: func() {
-			closeOrder = append(closeOrder, "body")
-		},
-	}
-	connectionCloseCount := 0
-	wrapped := &closeConnectionBody{
-		ReadCloser: body,
-		closeConnection: func() error {
-			connectionCloseCount++
-			closeOrder = append(closeOrder, "connection")
-			return connectionErr
-		},
-	}
-
-	payload, errRead := io.ReadAll(wrapped)
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-	if got, want := string(payload), "response"; got != want {
-		t.Fatalf("response body = %q, want %q", got, want)
-	}
-
-	errClose := wrapped.Close()
-	if !errors.Is(errClose, bodyErr) {
-		t.Fatalf("close error = %v, want body close error", errClose)
-	}
-	if !errors.Is(errClose, connectionErr) {
-		t.Fatalf("close error = %v, want connection close error", errClose)
-	}
-	if errCloseAgain := wrapped.Close(); errCloseAgain != errClose {
-		t.Fatalf("second close error = %v, want %v", errCloseAgain, errClose)
-	}
-	if body.closeCount != 1 {
-		t.Fatalf("body close count = %d, want 1", body.closeCount)
-	}
-	if connectionCloseCount != 1 {
-		t.Fatalf("connection close count = %d, want 1", connectionCloseCount)
-	}
-	if want := []string{"connection", "body"}; !reflect.DeepEqual(closeOrder, want) {
-		t.Fatalf("close order = %v, want %v", closeOrder, want)
-	}
-}
-
-func TestUtlsRoundTripperDialUsesRequestContext(t *testing.T) {
-	dialStarted := make(chan struct{})
-	roundTripper := &utlsRoundTripper{dialer: contextDialerFunc(func(ctx context.Context, _, _ string) (net.Conn, error) {
-		close(dialStarted)
-		<-ctx.Done()
-		return nil, ctx.Err()
-	})}
-	ctx, cancel := context.WithCancel(t.Context())
-	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/backend-api/codex/responses", nil)
-	if errRequest != nil {
-		t.Fatal(errRequest)
-	}
-	roundTripDone := make(chan error, 1)
-	go func() {
-		resp, errRoundTrip := roundTripper.RoundTrip(req)
-		if resp != nil && resp.Body != nil {
-			errRoundTrip = errors.Join(errRoundTrip, resp.Body.Close())
-		}
-		roundTripDone <- errRoundTrip
-	}()
-
-	select {
-	case <-dialStarted:
-	case <-time.After(time.Second):
-		t.Fatal("dial did not start")
-	}
-	cancel()
-	select {
-	case errRoundTrip := <-roundTripDone:
-		if !errors.Is(errRoundTrip, context.Canceled) {
-			t.Fatalf("RoundTrip error = %v, want context canceled", errRoundTrip)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("RoundTrip did not stop after context cancellation")
-	}
-}
-
-func TestUtlsRoundTripperHandshakeUsesRequestContext(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	t.Cleanup(func() {
-		if errClose := clientConn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) && !errors.Is(errClose, io.ErrClosedPipe) {
-			t.Errorf("close client connection: %v", errClose)
-		}
-		if errClose := serverConn.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) && !errors.Is(errClose, io.ErrClosedPipe) {
-			t.Errorf("close server connection: %v", errClose)
-		}
-	})
-
-	trackedConn := &trackedNetConn{Conn: clientConn}
-	dialDone := make(chan struct{})
-	roundTripper := &utlsRoundTripper{dialer: contextDialerFunc(func(context.Context, string, string) (net.Conn, error) {
-		close(dialDone)
-		return trackedConn, nil
-	})}
-	ctx, cancel := context.WithCancel(t.Context())
-	connectionDone := make(chan error, 1)
-	go func() {
-		h2Conn, errConnect := roundTripper.createConnection(ctx, "chatgpt.com", "chatgpt.com:443")
-		if h2Conn != nil {
-			errConnect = errors.Join(errConnect, h2Conn.Close())
-		}
-		connectionDone <- errConnect
-	}()
-
-	select {
-	case <-dialDone:
-	case <-time.After(time.Second):
-		t.Fatal("dial did not complete")
-	}
-	cancel()
-	select {
-	case errConnect := <-connectionDone:
-		if !errors.Is(errConnect, context.Canceled) {
-			t.Fatalf("createConnection error = %v, want context canceled", errConnect)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("TLS handshake did not stop after context cancellation")
-	}
-	if got := trackedConn.closeCount.Load(); got != 1 {
-		t.Fatalf("connection close count = %d, want 1", got)
-	}
 }
 
 type claudeCodeTLSFingerprintFixture struct {
@@ -276,9 +110,9 @@ func TestClaudeCodeTLSClientHelloSpecMatches220Capture(t *testing.T) {
 		t.Fatalf("JA3 = %q (%s), want %q (%s)", actual.JA3, actual.JA3MD5, fixture.JA3, fixture.JA3MD5)
 	}
 
-	transport, ok := newClaudeCodeRoundTripper("").(*http.Transport)
+	transport, ok := newClaudeCodeRoundTripper("", utlsTransportOptions{}).(*http.Transport)
 	if !ok {
-		t.Fatalf("Claude Code transport type = %T, want *http.Transport", newClaudeCodeRoundTripper(""))
+		t.Fatalf("Claude Code transport type = %T, want *http.Transport", newClaudeCodeRoundTripper("", utlsTransportOptions{}))
 	}
 	if transport.ForceAttemptHTTP2 {
 		t.Fatal("Claude Code transport must not force HTTP/2")
@@ -336,8 +170,8 @@ func TestCachedClaudeCodeRoundTripperReusesTransport(t *testing.T) {
 	t.Parallel()
 
 	const proxyURL = "http://127.0.0.1:29653"
-	first := cachedClaudeCodeRoundTripper(proxyURL)
-	second := cachedClaudeCodeRoundTripper(proxyURL)
+	first := cachedClaudeCodeRoundTripper(proxyURL, utlsTransportOptions{})
+	second := cachedClaudeCodeRoundTripper(proxyURL, utlsTransportOptions{})
 	if first != second {
 		t.Fatal("Claude Code transport cache returned different transports for one proxy")
 	}
@@ -345,14 +179,14 @@ func TestCachedClaudeCodeRoundTripperReusesTransport(t *testing.T) {
 
 func TestCachedClaudeCodeRoundTripperBoundsProxyCardinality(t *testing.T) {
 	firstProxy := fmt.Sprintf("http://127.0.0.1:%d", 30000)
-	first := cachedClaudeCodeRoundTripper(firstProxy)
+	first := cachedClaudeCodeRoundTripper(firstProxy, utlsTransportOptions{})
 	for index := 1; index <= claudeCodeRoundTripperCacheCapacity; index++ {
-		cachedClaudeCodeRoundTripper(fmt.Sprintf("http://127.0.0.1:%d", 30000+index))
+		cachedClaudeCodeRoundTripper(fmt.Sprintf("http://127.0.0.1:%d", 30000+index), utlsTransportOptions{})
 	}
 	if got := claudeCodeRoundTripperCache.Len(); got > claudeCodeRoundTripperCacheCapacity {
 		t.Fatalf("transport cache entries = %d, want at most %d", got, claudeCodeRoundTripperCacheCapacity)
 	}
-	if recreated := cachedClaudeCodeRoundTripper(firstProxy); recreated == first {
+	if recreated := cachedClaudeCodeRoundTripper(firstProxy, utlsTransportOptions{}); recreated == first {
 		t.Fatal("least recently used proxy transport was not evicted")
 	}
 }
@@ -432,6 +266,19 @@ func TestFallbackRoundTripperSelectsProviderFingerprint(t *testing.T) {
 		})
 	}
 }
+
+type contextAwareTestDialer struct{}
+
+func (contextAwareTestDialer) Dial(string, string) (net.Conn, error) {
+	return nil, errors.New("dial called without context")
+}
+
+func (contextAwareTestDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+var _ proxy.ContextDialer = contextAwareTestDialer{}
 
 func TestNewUtlsHTTPClientUsesContextRoundTripperForProtectedHost(t *testing.T) {
 	t.Parallel()
@@ -638,4 +485,164 @@ func summarizeClaudeCodeClientHelloSpec(t *testing.T, spec *tls.ClientHelloSpec)
 	digest := md5.Sum([]byte(summary.JA3)) // #nosec G401 -- JA3 requires MD5.
 	summary.JA3MD5 = hex.EncodeToString(digest[:])
 	return summary
+}
+
+func TestNewUtlsHTTPClientReusesProtectedTransport(t *testing.T) {
+	t.Parallel()
+
+	first := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
+	second := NewUtlsHTTPClient(context.Background(), nil, nil, 0)
+	firstTransport, ok := first.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("first transport = %T, want *fallbackRoundTripper", first.Transport)
+	}
+	secondTransport, ok := second.Transport.(*fallbackRoundTripper)
+	if !ok {
+		t.Fatalf("second transport = %T, want *fallbackRoundTripper", second.Transport)
+	}
+	if firstTransport.chrome != secondTransport.chrome {
+		t.Fatal("protected transports are not shared across clients")
+	}
+}
+
+func TestUtlsRoundTripperCancelsConnectionDial(t *testing.T) {
+	t.Parallel()
+
+	transport := newUtlsRoundTripperWithOptions("", utlsTransportOptions{})
+	transport.dialer = contextAwareTestDialer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext returned error: %v", err)
+	}
+
+	_, err = transport.RoundTrip(request)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RoundTrip error = %v, want context.Canceled", err)
+	}
+}
+
+func TestUtlsRoundTripperCircuitBreakerFastFails(t *testing.T) {
+	t.Parallel()
+
+	transport := newUtlsRoundTripperWithOptions("", utlsTransportOptions{
+		breakerFailures: 2,
+		breakerCooldown: time.Minute,
+	})
+	transport.recordConnectionFailure("chatgpt.com")
+	if err := transport.checkCircuit("chatgpt.com"); err != nil {
+		t.Fatalf("circuit opened before threshold: %v", err)
+	}
+	transport.recordConnectionFailure("chatgpt.com")
+	if err := transport.checkCircuit("chatgpt.com"); !errors.Is(err, errUtlsCircuitOpen) {
+		t.Fatalf("circuit error = %v, want errUtlsCircuitOpen", err)
+	}
+	transport.recordConnectionSuccess("chatgpt.com")
+	if err := transport.checkCircuit("chatgpt.com"); err != nil {
+		t.Fatalf("circuit remained open after success: %v", err)
+	}
+}
+
+func TestUtlsRoundTripperDoesNotCountClientCancellationAsConnectionFailure(t *testing.T) {
+	t.Parallel()
+
+	transport := newUtlsRoundTripperWithOptions("", utlsTransportOptions{
+		breakerFailures: 1,
+		breakerCooldown: time.Minute,
+	})
+	transport.dialer = contextAwareTestDialer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/", nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext returned error: %v", err)
+	}
+	_, _ = transport.RoundTrip(request)
+
+	if err = transport.checkCircuit("chatgpt.com"); err != nil {
+		t.Fatalf("client cancellation opened circuit: %v", err)
+	}
+}
+
+func TestSharedUtlsRoundTripperBoundsProxyAndOptionsCardinality(t *testing.T) {
+	for _, dimension := range []string{"proxy", "options"} {
+		t.Run(dimension, func(t *testing.T) {
+			const firstProxy = "http://127.0.0.1:31000"
+			first := sharedUtlsRoundTripper(firstProxy, utlsTransportOptions{})
+			for index := 1; index <= DefaultTransportCacheCapacity; index++ {
+				proxyURL := firstProxy
+				options := utlsTransportOptions{}
+				if dimension == "proxy" {
+					proxyURL = fmt.Sprintf("http://127.0.0.1:%d", 31000+index)
+				} else {
+					options.connectTimeout = time.Duration(index) * time.Second
+				}
+				sharedUtlsRoundTripper(proxyURL, options)
+			}
+			if got := sharedProtectedTransports.Len(); got > DefaultTransportCacheCapacity {
+				t.Fatalf("transport cache entries = %d, want at most %d", got, DefaultTransportCacheCapacity)
+			}
+			if recreated := sharedUtlsRoundTripper(firstProxy, utlsTransportOptions{}); recreated == first {
+				t.Fatal("least recently used transport was not evicted")
+			}
+		})
+	}
+}
+
+func TestSharedUtlsRoundTripperEvictionClosesIdleConnections(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	server.EnableHTTP2 = true
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	transport := sharedUtlsRoundTripper("direct", utlsTransportOptions{connectTimeout: 2 * time.Minute}).(*utlsRoundTripper)
+	// Trust only the local test server; the cache eviction still owns this real HTTP/2 pool.
+	transport.transport = &http2.Transport{TLSClientConfig: server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()}
+	defer transport.transport.CloseIdleConnections()
+	request, errRequest := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, nil)
+	if errRequest != nil {
+		t.Fatal(errRequest)
+	}
+	response, errResponse := transport.RoundTrip(request)
+	if errResponse != nil {
+		t.Fatal(errResponse)
+	}
+	_, errRead := io.ReadAll(response.Body)
+	errClose := response.Body.Close()
+	if errRead != nil || errClose != nil {
+		t.Fatalf("read/close response: %v / %v", errRead, errClose)
+	}
+	for index := 1; index <= DefaultTransportCacheCapacity; index++ {
+		sharedUtlsRoundTripper("direct", utlsTransportOptions{connectTimeout: time.Duration(index) * time.Second})
+	}
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("evicting the transport did not close its idle HTTP/2 connection")
+	}
+}
+
+type nonContextTestDialer struct{}
+
+func (nonContextTestDialer) Dial(string, string) (net.Conn, error) {
+	return nil, errors.New("unsupported Dial must not be called")
+}
+
+func TestDialWithContextRejectsUnsupportedDialer(t *testing.T) {
+	_, err := dialWithContext(t.Context(), nonContextTestDialer{}, "tcp", "unused:443")
+	if err == nil || err.Error() != "utls: dialer does not support context cancellation" {
+		t.Fatalf("dial error = %v, want unsupported context cancellation", err)
+	}
 }

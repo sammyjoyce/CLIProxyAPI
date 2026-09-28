@@ -115,13 +115,20 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.RegistrationEpoch = m.authEpochs[auth.ID]
 	auth.Generation = 1
 	authClone := auth.Clone()
+	// Clone the scheduler entry while the lock is held: publishing authClone
+	// makes its metadata map reachable to concurrent writers, so cloning it
+	// after the unlock would race them.
+	var schedulerAuth *Auth
+	if m.scheduler != nil {
+		schedulerAuth = authClone.Clone()
+	}
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
-	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone.Clone())
+	if schedulerAuth != nil {
+		m.scheduler.upsertAuth(schedulerAuth)
 	}
 	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
@@ -265,13 +272,20 @@ func (m *Manager) updateInternal(ctx context.Context, base, auth *Auth, mode upd
 		}
 	}
 	authClone := auth.Clone()
+	// Clone the scheduler entry while the lock is held: publishing authClone
+	// makes its metadata map reachable to concurrent writers, so cloning it
+	// after the unlock would race them.
+	var schedulerAuth *Auth
+	if m.scheduler != nil {
+		schedulerAuth = authClone.Clone()
+	}
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
-	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone.Clone())
+	if schedulerAuth != nil {
+		m.scheduler.upsertAuth(schedulerAuth)
 	}
 	m.structuralEpoch.Add(1)
 	m.queueRefreshReschedule(auth.ID)
