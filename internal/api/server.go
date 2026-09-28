@@ -69,15 +69,19 @@ type Server struct {
 	requestLogger logging.RequestLogger
 	loggerToggle  func(bool)
 
+	// activeRequestLimits is the process's single limiter-generation baseline.
+	// It is immutable after startup; hot reload never rebuilds the request limiter.
+	activeRequestLimits config.RequestLimitsConfig
+
 	// configFilePath is the absolute path to the YAML config file for persistence.
 	configFilePath string
 
 	// currentPath is the absolute path to the current working directory.
 	currentPath string
 
-	// wsRoutes tracks registered websocket upgrade paths.
-	wsRouteMu     sync.Mutex
-	wsRoutes      map[string]struct{}
+	// wsRoutes tracks the route patterns registered as websocket upgrade
+	// endpoints; the request limiter's dedicated websocket lane consults it.
+	wsRoutes      *websocketRouteSet
 	wsAuthChanged func(bool, bool)
 	wsAuthEnabled atomic.Bool
 
@@ -148,6 +152,20 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
+	engine.Use(corsMiddleware())
+
+	// The request limiter's dedicated websocket lane classifies a request by the
+	// route the router matched, so the websocket route set has to exist before
+	// setupRoutes and AttachWebsocketRoute register their routes.
+	wsRoutes := newWebsocketRouteSet()
+	requestLimiter := newRequestLimiter(cfg, wsRoutes)
+	engine.Use(func(c *gin.Context) {
+		if !isExampleAPIKeySafeModeProxyPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		requestLimiter(c)
+	})
 
 	// Add request logging middleware (positioned after recovery, before auth)
 	// Resolve logs directory relative to the configuration file directory.
@@ -165,7 +183,6 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		}
 	}
 
-	engine.Use(corsMiddleware())
 	wd, err := os.Getwd()
 	if err != nil {
 		wd = configFilePath
@@ -183,10 +200,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		accessManager:       accessManager,
 		requestLogger:       requestLogger,
 		loggerToggle:        toggle,
+		activeRequestLimits: cfg.RequestLimits,
 		configFilePath:      configFilePath,
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
-		wsRoutes:            make(map[string]struct{}),
+		wsRoutes:            wsRoutes,
 		pluginHost:          optionState.pluginHost,
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
@@ -448,4 +466,16 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	log.Debug("API server stopped")
 	return nil
+}
+
+func newRequestLimiter(cfg *config.Config, wsRoutes *websocketRouteSet) gin.HandlerFunc {
+	options := middleware.RequestLimitOptions{WebsocketRoute: wsRoutes.contains}
+	if cfg == nil {
+		return middleware.NewRequestLimiter(options).Middleware()
+	}
+	options.MaxConcurrent = cfg.RequestLimits.MaxConcurrent
+	options.MaxWebsocketConnections = cfg.RequestLimits.MaxWebsocketConnections
+	options.MaxQueued = cfg.RequestLimits.MaxQueued
+	options.QueueTimeout = time.Duration(cfg.RequestLimits.QueueTimeoutSeconds) * time.Second
+	return middleware.NewRequestLimiter(options).Middleware()
 }

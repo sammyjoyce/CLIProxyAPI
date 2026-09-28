@@ -15,19 +15,32 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
 const (
-	apiAttemptsKey                 = "API_UPSTREAM_ATTEMPTS"
-	apiRequestKey                  = "API_REQUEST"
-	apiResponseKey                 = "API_RESPONSE"
-	apiWebsocketTimelineKey        = "API_WEBSOCKET_TIMELINE"
-	deferredAPIRequestBytesKey     = "DEFERRED_API_REQUEST_BYTES"
-	creditsUsedKey                 = "__antigravity_credits_used__"
-	maxDeferredAPIRequestBodyBytes = 32 << 20 // 32 MiB
+	apiAttemptsKey                    = "API_UPSTREAM_ATTEMPTS"
+	apiRequestKey                     = "API_REQUEST"
+	apiResponseKey                    = "API_RESPONSE"
+	apiWebsocketTimelineKey           = "API_WEBSOCKET_TIMELINE"
+	deferredAPIRequestBytesKey        = "DEFERRED_API_REQUEST_BYTES"
+	deferredWebsocketStateKey         = "DEFERRED_WEBSOCKET_LOG_STATE"
+	creditsUsedKey                    = "__antigravity_credits_used__"
+	maxDeferredAPIRequestBodyBytes    = 32 << 20 // 32 MiB
+	maxDeferredWebsocketBodyBytes     = 1 << 20  // 1 MiB
+	maxDeferredWebsocketUsefulEntries = 128
+	maxDeferredWebsocketRenderedBytes = 2 << 20 // 2 MiB
 )
+
+// deferredWebsocketTruncationMarker terminates the downstream WebSocket deferred request log
+// once either the useful entry count or the aggregate rendered byte limit is reached.
+const deferredWebsocketTruncationMarker = "[API REQUEST LOG TRUNCATED: additional downstream WebSocket requests omitted]\n\n"
+
+// deferredLogTimeNow captures downstream deferred request timestamps. It defaults to time.Now
+// and is replaceable only by tests in this package.
+var deferredLogTimeNow = time.Now
 
 // UpstreamRequestLog captures the outbound upstream request details for logging.
 type UpstreamRequestLog struct {
@@ -71,7 +84,7 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 		return
 	}
 	if !cfg.RequestLog {
-		deferAPIRequest(ginCtx, info)
+		deferAPIRequest(ctx, ginCtx, info)
 		return
 	}
 
@@ -125,8 +138,12 @@ func RecordAPIRequest(ctx context.Context, cfg *config.Config, info UpstreamRequ
 	}
 }
 
-func deferAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog) {
+func deferAPIRequest(ctx context.Context, ginCtx *gin.Context, info UpstreamRequestLog) {
 	if ginCtx == nil {
+		return
+	}
+	if cliproxyexecutor.DownstreamWebsocket(ctx) {
+		deferDownstreamAPIRequest(ginCtx, info)
 		return
 	}
 	var requests []logging.DeferredAPIRequest
@@ -138,7 +155,8 @@ func deferAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog) {
 	capturedAt := time.Now()
 	capturedBytes, _ := ginCtx.Get(deferredAPIRequestBytesKey)
 	bytesUsed, _ := capturedBytes.(int)
-	remaining := maxDeferredAPIRequestBodyBytes - bytesUsed
+	maxBodyBytes := maxDeferredAPIRequestBodyBytes
+	remaining := maxBodyBytes - bytesUsed
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -152,39 +170,179 @@ func deferAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog) {
 	ginCtx.Set(deferredAPIRequestBytesKey, bytesUsed+captureLength)
 	requests = append(requests, func() []byte {
 		builder := newAPIRequestLogBuilder(index, capturedInfo, capturedAt)
-		if bodyEmpty {
-			builder.WriteString("<empty>")
-		} else {
-			builder.Write(capturedInfo.Body)
-			if bodyTruncated {
-				builder.WriteString(fmt.Sprintf("\n[API REQUEST BODY TRUNCATED: captured first %d bytes]", captureLength))
-			}
-		}
-		builder.WriteString("\n\n")
+		writeAPIRequestLogBody(builder, capturedInfo.Body, bodyEmpty, bodyTruncated, captureLength)
 		return []byte(builder.String())
 	})
 	ginCtx.Set(logging.DeferredAPIRequestContextKey, requests)
 }
 
+// deferredWebsocketLogState tracks aggregate rendered bytes and terminal truncation state for
+// downstream WebSocket deferred request logging under deferredWebsocketStateKey.
+type deferredWebsocketLogState struct {
+	renderedBytes int
+	truncated     bool
+}
+
+func getDeferredWebsocketLogState(ginCtx *gin.Context) deferredWebsocketLogState {
+	if ginCtx == nil {
+		return deferredWebsocketLogState{}
+	}
+	if value, exists := ginCtx.Get(deferredWebsocketStateKey); exists {
+		if state, ok := value.(deferredWebsocketLogState); ok {
+			return state
+		}
+	}
+	return deferredWebsocketLogState{}
+}
+
+func setDeferredWebsocketLogState(ginCtx *gin.Context, state deferredWebsocketLogState) {
+	ginCtx.Set(deferredWebsocketStateKey, state)
+}
+
+// logTextWriter is the minimal writer surface used by the API request log formatter, so the
+// same formatting code can target either a strings.Builder or a bounded capture buffer.
+type logTextWriter interface {
+	WriteString(s string) (int, error)
+	Write(p []byte) (int, error)
+}
+
+// boundedLogWriter retains at most limit bytes while counting the total attempted length, so an
+// oversized render is detected and discarded without keeping the full output.
+type boundedLogWriter struct {
+	buf   bytes.Buffer
+	limit int
+	total int
+}
+
+func (w *boundedLogWriter) Write(p []byte) (int, error) {
+	w.total += len(p)
+	if remaining := w.limit - w.buf.Len(); remaining > 0 {
+		if len(p) <= remaining {
+			w.buf.Write(p)
+		} else {
+			w.buf.Write(p[:remaining])
+		}
+	}
+	return len(p), nil
+}
+
+func (w *boundedLogWriter) WriteString(s string) (int, error) {
+	return w.Write([]byte(s))
+}
+
+// deferDownstreamAPIRequest captures a downstream WebSocket request while request logging is
+// disabled. Every admitted request is fully rendered and masked up front, so deferred closures
+// hold only bounded byte slices. Admission stops after maxDeferredWebsocketUsefulEntries useful
+// requests or when the aggregate rendered output would exceed maxDeferredWebsocketRenderedBytes
+// (the marker length is always reserved from that budget). The first omission appends the
+// truncation marker exactly once and turns every later call into a complete no-op.
+func deferDownstreamAPIRequest(ginCtx *gin.Context, info UpstreamRequestLog) {
+	state := getDeferredWebsocketLogState(ginCtx)
+	if state.truncated {
+		return
+	}
+	var requests []logging.DeferredAPIRequest
+	if value, exists := ginCtx.Get(logging.DeferredAPIRequestContextKey); exists {
+		requests, _ = value.([]logging.DeferredAPIRequest)
+	}
+	if len(requests) >= maxDeferredWebsocketUsefulEntries {
+		appendDeferredWebsocketTruncation(ginCtx, &state, requests)
+		return
+	}
+
+	capturedAt := deferredLogTimeNow()
+	capturedInfo := info
+	capturedBytes, _ := ginCtx.Get(deferredAPIRequestBytesKey)
+	bytesUsed, _ := capturedBytes.(int)
+	remaining := maxDeferredWebsocketBodyBytes - bytesUsed
+	if remaining < 0 {
+		remaining = 0
+	}
+	captureLength := len(info.Body)
+	if captureLength > remaining {
+		captureLength = remaining
+	}
+	capturedInfo.Body = bytes.Clone(info.Body[:captureLength])
+	bodyEmpty := len(info.Body) == 0
+	bodyTruncated := captureLength < len(info.Body)
+
+	index := len(requests) + 1
+	allowance := maxDeferredWebsocketRenderedBytes - len(deferredWebsocketTruncationMarker) - state.renderedBytes
+	if allowance < 0 {
+		allowance = 0
+	}
+	writer := &boundedLogWriter{limit: allowance}
+	writeAPIRequestLogPrefix(writer, index, capturedInfo, capturedAt)
+	writeAPIRequestLogBody(writer, capturedInfo.Body, bodyEmpty, bodyTruncated, captureLength)
+	if writer.total > allowance {
+		// The candidate exceeds the remaining useful-byte allowance: discard its partial
+		// render, skip its staged body accounting, and terminate with the marker.
+		appendDeferredWebsocketTruncation(ginCtx, &state, requests)
+		return
+	}
+
+	rendered := bytes.Clone(writer.buf.Bytes())
+	ginCtx.Set(deferredAPIRequestBytesKey, bytesUsed+captureLength)
+	state.renderedBytes += len(rendered)
+	setDeferredWebsocketLogState(ginCtx, state)
+	requests = append(requests, func() []byte {
+		return bytes.Clone(rendered)
+	})
+	ginCtx.Set(logging.DeferredAPIRequestContextKey, requests)
+}
+
+// appendDeferredWebsocketTruncation appends the truncation marker exactly once, accounts for its
+// rendered bytes, and marks the downstream deferred log as terminal.
+func appendDeferredWebsocketTruncation(ginCtx *gin.Context, state *deferredWebsocketLogState, requests []logging.DeferredAPIRequest) {
+	marker := []byte(deferredWebsocketTruncationMarker)
+	requests = append(requests, func() []byte {
+		return bytes.Clone(marker)
+	})
+	ginCtx.Set(logging.DeferredAPIRequestContextKey, requests)
+	state.renderedBytes += len(marker)
+	state.truncated = true
+	setDeferredWebsocketLogState(ginCtx, *state)
+}
+
 func newAPIRequestLogBuilder(index int, info UpstreamRequestLog, timestamp time.Time) *strings.Builder {
 	builder := &strings.Builder{}
-	builder.WriteString(fmt.Sprintf("=== API REQUEST %d ===\n", index))
-	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano)))
+	writeAPIRequestLogPrefix(builder, index, info, timestamp)
+	return builder
+}
+
+// writeAPIRequestLogPrefix writes the request metadata section shared by the in-memory builder
+// and the bounded pre-render used for downstream WebSocket deferred requests.
+func writeAPIRequestLogPrefix(w logTextWriter, index int, info UpstreamRequestLog, timestamp time.Time) {
+	w.WriteString(fmt.Sprintf("=== API REQUEST %d ===\n", index))
+	w.WriteString(fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano)))
 	if info.URL != "" {
-		builder.WriteString(fmt.Sprintf("Upstream URL: %s\n", info.URL))
+		w.WriteString(fmt.Sprintf("Upstream URL: %s\n", info.URL))
 	} else {
-		builder.WriteString("Upstream URL: <unknown>\n")
+		w.WriteString("Upstream URL: <unknown>\n")
 	}
 	if info.Method != "" {
-		builder.WriteString(fmt.Sprintf("HTTP Method: %s\n", info.Method))
+		w.WriteString(fmt.Sprintf("HTTP Method: %s\n", info.Method))
 	}
 	if auth := formatAuthInfo(info); auth != "" {
-		builder.WriteString(fmt.Sprintf("Auth: %s\n", auth))
+		w.WriteString(fmt.Sprintf("Auth: %s\n", auth))
 	}
-	builder.WriteString("\nHeaders:\n")
-	writeHeaders(builder, info.Headers)
-	builder.WriteString("\nBody:\n")
-	return builder
+	w.WriteString("\nHeaders:\n")
+	writeHeaders(w, info.Headers)
+	w.WriteString("\nBody:\n")
+}
+
+// writeAPIRequestLogBody writes the deferred body section, preserving the per-body truncation
+// notice and the <empty> marker exactly.
+func writeAPIRequestLogBody(w logTextWriter, body []byte, bodyEmpty, bodyTruncated bool, captureLength int) {
+	if bodyEmpty {
+		w.WriteString("<empty>")
+	} else {
+		w.Write(body)
+		if bodyTruncated {
+			w.WriteString(fmt.Sprintf("\n[API REQUEST BODY TRUNCATED: captured first %d bytes]", captureLength))
+		}
+	}
+	w.WriteString("\n\n")
 }
 
 // RecordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
@@ -632,7 +790,7 @@ func markAPIResponseTimestamp(ginCtx *gin.Context) {
 	ginCtx.Set("API_RESPONSE_TIMESTAMP", time.Now())
 }
 
-func writeHeaders(builder *strings.Builder, headers http.Header) {
+func writeHeaders(builder logTextWriter, headers http.Header) {
 	if builder == nil {
 		return
 	}

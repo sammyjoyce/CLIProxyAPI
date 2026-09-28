@@ -902,6 +902,9 @@ type OpenAICompatibilityModel struct {
 	// MaxContextLength overrides the context window advertised to Codex clients.
 	MaxContextLength int `yaml:"max-context-length,omitempty" json:"max-context-length,omitempty"`
 
+	// MaxCompletionTokens overrides the completion cap advertised to Claude clients.
+	MaxCompletionTokens int `yaml:"max-completion-tokens,omitempty" json:"max-completion-tokens,omitempty"`
+
 	// ForceMapping rewrites upstream response model fields back to Alias.
 	ForceMapping bool `yaml:"force-mapping,omitempty" json:"force-mapping,omitempty"`
 
@@ -934,6 +937,7 @@ func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
 
 func (m OpenAICompatibilityModel) GetDisplayName() string          { return m.DisplayName }
 func (m OpenAICompatibilityModel) GetMaxContextLength() int        { return m.MaxContextLength }
+func (m OpenAICompatibilityModel) GetMaxCompletionTokens() int     { return m.MaxCompletionTokens }
 func (m OpenAICompatibilityModel) GetForceMapping() bool           { return m.ForceMapping }
 func (m OpenAICompatibilityModel) GetIsCompat() bool               { return m.IsCompat }
 func (m OpenAICompatibilityModel) GetUseMaxCompletionTokens() bool { return m.UseMaxCompletionTokens }

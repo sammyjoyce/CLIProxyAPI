@@ -563,6 +563,67 @@ func TestCodexClientModelsResponseDoesNotInheritUnsupportedReasoningLevels(t *te
 	}
 }
 
+func TestCodexClientModelsResponseClearsEmptyThinkingLevels(t *testing.T) {
+	resp := BuildResponse([]map[string]any{
+		{
+			"id":                 "glm-5.3",
+			"display_name":       "GLM-5.3",
+			"max_context_length": 1000000,
+			"context_length":     1000000,
+		},
+	}, nil, false)
+	models, ok := resp["models"].([]map[string]any)
+	if !ok {
+		t.Fatalf("models type = %T, want []map[string]any", resp["models"])
+	}
+	var entry map[string]any
+	for _, model := range models {
+		if stringModelValue(model, "slug") == "glm-5.3" {
+			entry = model
+			break
+		}
+	}
+	if entry == nil {
+		t.Fatal("missing glm-5.3")
+	}
+	if got := intModelValue(entry, "context_window"); got != 1000000 {
+		t.Fatalf("context_window = %d, want 1000000", got)
+	}
+
+	// Register empty thinking so the builder can distinguish "inherit" from "clear".
+	registry.GetGlobalRegistry().RegisterClient("test-glm-5.3", "zai", []*registry.ModelInfo{{
+		ID:            "glm-5.3",
+		ContextLength: 1000000,
+		Thinking:      &registry.ThinkingSupport{Levels: []string{}},
+	}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient("test-glm-5.3")
+	})
+
+	resp = BuildResponse([]map[string]any{
+		{"id": "glm-5.3", "display_name": "GLM-5.3", "max_context_length": 1000000},
+	}, nil, false)
+	models, _ = resp["models"].([]map[string]any)
+	entry = nil
+	for _, model := range models {
+		if stringModelValue(model, "slug") == "glm-5.3" {
+			entry = model
+			break
+		}
+	}
+	if entry == nil {
+		t.Fatal("missing glm-5.3 after registry registration")
+	}
+	// Since upstream 5208aec7, an empty levels array is preserved (the client
+	// distinguishes "no reasoning support" from unknown) while the default is dropped.
+	if levels, ok := entry["supported_reasoning_levels"].([]any); !ok || len(levels) != 0 {
+		t.Fatalf("supported_reasoning_levels = %#v, want empty array", entry["supported_reasoning_levels"])
+	}
+	if _, ok := entry["default_reasoning_level"]; ok {
+		t.Fatalf("default_reasoning_level = %#v, want omitted", entry["default_reasoning_level"])
+	}
+}
+
 func TestSanitizeCodexClientReasoningMetadataPreservesEmptyArray(t *testing.T) {
 	tests := []struct {
 		name    string

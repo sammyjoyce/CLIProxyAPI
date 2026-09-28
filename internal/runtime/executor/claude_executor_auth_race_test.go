@@ -128,3 +128,29 @@ func TestClaudeExecutorSharedCredentialMetadataMixedAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestClaudeSetupTokenReadsConcurrentMetadataWrites(t *testing.T) {
+	auth := newSharedClaudeOAuthAuth("claude-setup-token-race")
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 10000 {
+			claudeauth.StoreMetadataString(&auth.Metadata, "account_uuid", "audit-account")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 10000 {
+			if isClaudeSetupToken(auth, "sk-ant-oat-race-probe") {
+				t.Error("ordinary OAuth credential classified as a setup token")
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+}

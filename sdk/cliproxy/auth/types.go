@@ -300,6 +300,9 @@ func (a *Auth) Clone() *Auth {
 		}
 	}
 	if a.Metadata != nil {
+		// Copy non-nil maps even when they are empty: a clone that aliased an
+		// empty map would let a writer outside the manager lock mutate the shared
+		// credential's metadata map through the copy.
 		copyAuth.Metadata = make(map[string]any, len(a.Metadata))
 		for key, value := range a.Metadata {
 			copyAuth.Metadata[key] = value

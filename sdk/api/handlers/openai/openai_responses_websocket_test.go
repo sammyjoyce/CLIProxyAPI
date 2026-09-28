@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	requestlogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	executorhelps "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executionregistry"
@@ -725,6 +726,14 @@ type websocketCanonicalRollbackExecutor struct {
 	failErr error
 }
 
+type websocketDisconnectCancellationExecutor struct {
+	started      chan struct{}
+	canceled     chan struct{}
+	release      chan struct{}
+	startedOnce  sync.Once
+	canceledOnce sync.Once
+}
+
 type websocketPinnedFailoverStatusError struct {
 	status int
 	msg    string
@@ -939,6 +948,38 @@ func (e *websocketCanonicalRollbackExecutor) Payloads() [][]byte {
 		out[i] = bytes.Clone(e.payloads[i])
 	}
 	return out
+}
+
+func (e *websocketDisconnectCancellationExecutor) Identifier() string { return "test-provider" }
+
+func (e *websocketDisconnectCancellationExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *websocketDisconnectCancellationExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	chunks := make(chan coreexecutor.StreamChunk)
+	e.startedOnce.Do(func() { close(e.started) })
+	go func() {
+		select {
+		case <-ctx.Done():
+			e.canceledOnce.Do(func() { close(e.canceled) })
+		case <-e.release:
+		}
+		close(chunks)
+	}()
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (e *websocketDisconnectCancellationExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *websocketDisconnectCancellationExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *websocketDisconnectCancellationExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
 }
 
 type websocketUpstreamDisconnectExecutor struct {
@@ -2986,6 +3027,85 @@ func TestResponsesWebsocketTimelineRecordsDisconnectEvent(t *testing.T) {
 	}
 }
 
+func TestNextResponsesWebsocketReadResultStopsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	readResults := make(chan responsesWebsocketReadResult, 1)
+	readResults <- responsesWebsocketReadResult{messageType: websocket.TextMessage, payload: []byte(`{"type":"response.create"}`)}
+	cancel()
+
+	if _, ok := nextResponsesWebsocketReadResult(ctx, readResults); ok {
+		t.Fatal("canceled downstream context accepted a queued websocket request")
+	}
+}
+
+func TestResponsesWebsocketDisconnectAfterPipelinedMessageCancelsActiveStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &websocketDisconnectCancellationExecutor{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	t.Cleanup(func() { close(executor.release) })
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "auth-disconnect", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "disconnect-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	handlerDone := make(chan struct{})
+	router := gin.New()
+	router.GET("/v1/responses/ws", func(c *gin.Context) {
+		defer close(handlerDone)
+		h.ResponsesWebsocket(c)
+	})
+
+	server := httptest.NewServer(router)
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+
+	request := []byte(`{"type":"response.create","model":"disconnect-model","input":[{"role":"user","content":"wait"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+		_ = conn.Close()
+		t.Fatalf("write websocket request: %v", errWrite)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(2 * time.Second):
+		_ = conn.Close()
+		t.Fatal("timed out waiting for upstream stream to start")
+	}
+	pipelinedRequest := []byte(`{"type":"response.create","input":[{"role":"user","content":"queued"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, pipelinedRequest); errWrite != nil {
+		_ = conn.Close()
+		t.Fatalf("write pipelined websocket request: %v", errWrite)
+	}
+	if errClose := conn.Close(); errClose != nil {
+		t.Fatalf("close websocket: %v", errClose)
+	}
+
+	select {
+	case <-executor.canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("downstream disconnect did not cancel active upstream stream")
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("websocket handler did not return after downstream disconnect")
+	}
+}
+
 func TestResponsesWebsocketMirrorsUpstreamMessageTooBigDisconnect(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -3365,6 +3485,93 @@ func TestResponsesWebsocketTerminalErrorWrittenOnceAcrossForwardAndDisconnect(t 
 	}
 	if errServer := <-serverErrCh; errServer != nil {
 		t.Fatalf("server error: %v", errServer)
+	}
+}
+
+func TestResponsesWebsocketRejectsOversizedDownstreamMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &homeResponsesWebsocketExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "auth-oversized-read-limit", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "oversized-read-limit-model"}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// A small well-formed request proves the pipeline reaches the executor for
+	// valid messages, so rejection of the oversized message below is caused by
+	// the read limit rather than by request validation.
+	smallRequest := []byte(`{"type":"response.create","model":"oversized-read-limit-model","input":[{"type":"message","role":"user","content":"hi"}]}`)
+	if errWrite := conn.WriteMessage(websocket.TextMessage, smallRequest); errWrite != nil {
+		t.Fatalf("write small websocket request: %v", errWrite)
+	}
+	if errDeadline := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+		t.Fatalf("set read deadline: %v", errDeadline)
+	}
+	_, smallResponse, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read small websocket response: %v", errRead)
+	}
+	if got := gjson.GetBytes(smallResponse, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("small response type = %q, want %q: %s", got, wsEventTypeCompleted, smallResponse)
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("executor calls after small request = %d, want 1", got)
+	}
+
+	// Pad an otherwise valid response.create request to one byte past the
+	// production read limit, keeping the padding inside a JSON string so the
+	// payload stays a valid Responses request shape.
+	prefix := []byte(`{"type":"response.create","model":"oversized-read-limit-model","input":[{"type":"message","role":"user","content":"`)
+	suffix := []byte(`"}]}`)
+	payloadSize := wsDownstreamReadLimit + 1
+	oversized := make([]byte, 0, payloadSize)
+	oversized = append(oversized, prefix...)
+	block := bytes.Repeat([]byte("a"), 1<<20)
+	for len(oversized) < payloadSize-len(suffix) {
+		oversized = append(oversized, block[:min(len(block), payloadSize-len(suffix)-len(oversized))]...)
+	}
+	oversized = append(oversized, suffix...)
+	if len(oversized) != payloadSize {
+		t.Fatalf("oversized payload length = %d, want %d", len(oversized), payloadSize)
+	}
+	if !json.Valid(oversized) {
+		t.Fatal("oversized payload is not valid JSON")
+	}
+
+	if errWrite := conn.WriteMessage(websocket.TextMessage, oversized); errWrite != nil {
+		t.Fatalf("write oversized websocket request: %v", errWrite)
+	}
+	if errDeadline := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+		t.Fatalf("set read deadline: %v", errDeadline)
+	}
+	_, _, errRead = conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	if !errors.As(errRead, &closeErr) {
+		t.Fatalf("expected websocket close error for oversized message, got %v", errRead)
+	}
+	if closeErr.Code != websocket.CloseMessageTooBig {
+		t.Fatalf("close code = %d, want %d (message too big)", closeErr.Code, websocket.CloseMessageTooBig)
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("executor calls after oversized request = %d, want 1 (oversized message must be rejected before execution)", got)
 	}
 }
 
@@ -7774,5 +7981,265 @@ func TestForwardResponsesWebsocketPingWriteFailureAbortsSession(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out awaiting cancel callback on ping write failure")
+	}
+}
+
+// responsesWebsocketDeferredTruncationMarker mirrors the unexported terminal marker appended by
+// executorhelps once the downstream WebSocket deferred request log reaches its bounds.
+const responsesWebsocketDeferredTruncationMarker = "[API REQUEST LOG TRUNCATED: additional downstream WebSocket requests omitted]\n\n"
+
+type responsesWebsocketDeferredSnapshot struct {
+	entries [][]byte
+	joined  []byte
+}
+
+type responsesWebsocketDeferredObservation struct {
+	downstreamWebsocket bool
+	sourceFormat        string
+	requestedModel      string
+	stream              bool
+	body                []byte
+	executorCalls       int32
+	before              responsesWebsocketDeferredSnapshot
+	after               responsesWebsocketDeferredSnapshot
+	err                 error
+}
+
+// responsesWebsocketDeferredRouteHost gates model routing so the test can inspect the deferred
+// request log bounds on the exact context PrepareStreamModelRoute hands to the router.
+type responsesWebsocketDeferredRouteHost struct {
+	cfg         *internalconfig.Config
+	executor    *homeResponsesWebsocketExecutor
+	logInfo     executorhelps.UpstreamRequestLog
+	release     chan struct{}
+	releaseOnce sync.Once
+	observed    chan responsesWebsocketDeferredObservation
+}
+
+func (*responsesWebsocketDeferredRouteHost) HasModelRouters() bool { return true }
+
+func (h *responsesWebsocketDeferredRouteHost) Release() {
+	h.releaseOnce.Do(func() { close(h.release) })
+}
+
+func (h *responsesWebsocketDeferredRouteHost) RouteModel(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+	observation := responsesWebsocketDeferredObservation{
+		downstreamWebsocket: coreexecutor.DownstreamWebsocket(ctx),
+		sourceFormat:        req.SourceFormat,
+		requestedModel:      req.RequestedModel,
+		stream:              req.Stream,
+		body:                bytes.Clone(req.Body),
+		executorCalls:       h.executor.calls.Load(),
+	}
+	for i := 0; i < 129; i++ {
+		executorhelps.RecordAPIRequest(ctx, h.cfg, h.logInfo)
+	}
+	before, errBefore := snapshotResponsesWebsocketDeferredRequests(ctx)
+	for i := 0; i < 160; i++ {
+		executorhelps.RecordAPIRequest(ctx, h.cfg, h.logInfo)
+	}
+	after, errAfter := snapshotResponsesWebsocketDeferredRequests(ctx)
+	observation.before = before
+	observation.after = after
+	observation.err = errors.Join(errBefore, errAfter)
+	h.observed <- observation
+	select {
+	case <-h.release:
+	case <-ctx.Done():
+	}
+	return pluginapi.ModelRouteResponse{}, false
+}
+
+// snapshotResponsesWebsocketDeferredRequests renders the Gin deferred request closures captured
+// on the route context, cloning every rendered byte slice so later mutation of the live
+// deferred state cannot affect the snapshot.
+func snapshotResponsesWebsocketDeferredRequests(ctx context.Context) (responsesWebsocketDeferredSnapshot, error) {
+	var snapshot responsesWebsocketDeferredSnapshot
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return snapshot, errors.New("route context does not carry the gin context")
+	}
+	value, exists := ginCtx.Get(requestlogging.DeferredAPIRequestContextKey)
+	if !exists {
+		return snapshot, errors.New("deferred API request context key is not set")
+	}
+	requests, ok := value.([]requestlogging.DeferredAPIRequest)
+	if !ok {
+		return snapshot, fmt.Errorf("deferred API requests = %#v, want []requestlogging.DeferredAPIRequest", value)
+	}
+	snapshot.entries = make([][]byte, 0, len(requests))
+	for _, buildRequest := range requests {
+		if buildRequest == nil {
+			continue
+		}
+		rendered := bytes.Clone(buildRequest())
+		snapshot.entries = append(snapshot.entries, rendered)
+		snapshot.joined = append(snapshot.joined, rendered...)
+	}
+	return snapshot, nil
+}
+
+// responsesWebsocketDeferredBodyTotals validates the numbered request headers and the exact
+// deterministic body section of the first wantEntries rendered entries, and totals their body bytes.
+func responsesWebsocketDeferredBodyTotals(t *testing.T, entries [][]byte, wantEntries int, wantBody []byte) int {
+	t.Helper()
+	total := 0
+	for index := 0; index < wantEntries; index++ {
+		entry := entries[index]
+		wantPrefix := fmt.Sprintf("=== API REQUEST %d ===\n", index+1)
+		if !bytes.HasPrefix(entry, []byte(wantPrefix)) {
+			t.Fatalf("deferred entry %d prefix = %q, want %q", index, entry[:min(len(entry), 32)], wantPrefix)
+		}
+		const bodySectionMarker = "\nBody:\n"
+		bodyStart := bytes.Index(entry, []byte(bodySectionMarker))
+		if bodyStart < 0 {
+			t.Fatalf("deferred entry %d is missing the body section", index)
+		}
+		body := entry[bodyStart+len(bodySectionMarker):]
+		if !bytes.HasSuffix(body, []byte("\n\n")) {
+			t.Fatalf("deferred entry %d body section is missing its terminator", index)
+		}
+		body = body[:len(body)-len("\n\n")]
+		if !bytes.Equal(body, wantBody) {
+			t.Fatalf("deferred entry %d body = %d bytes, want the exact deterministic %d-byte body", index, len(body), len(wantBody))
+		}
+		total += len(body)
+	}
+	return total
+}
+
+func assertResponsesWebsocketDeferredSnapshot(t *testing.T, name string, snapshot responsesWebsocketDeferredSnapshot, wantBody []byte) {
+	t.Helper()
+	const (
+		usefulEntries    = 128
+		maxRenderedBytes = 2 << 20
+		maxBodyBytes     = 1 << 20
+	)
+	if len(snapshot.entries) != usefulEntries+1 {
+		t.Fatalf("%s deferred entries = %d, want %d (128 useful + 1 truncation marker)", name, len(snapshot.entries), usefulEntries+1)
+	}
+	if got := responsesWebsocketDeferredBodyTotals(t, snapshot.entries, usefulEntries, wantBody); got != maxBodyBytes {
+		t.Fatalf("%s request body bytes = %d, want exactly %d", name, got, maxBodyBytes)
+	}
+	if got := string(snapshot.entries[usefulEntries]); got != responsesWebsocketDeferredTruncationMarker {
+		t.Fatalf("%s entry %d = %q, want the truncation marker with two trailing newlines", name, usefulEntries, got)
+	}
+	if got := bytes.Count(snapshot.joined, []byte("=== API REQUEST ")); got != usefulEntries {
+		t.Fatalf("%s joined request prefixes = %d, want exactly %d", name, got, usefulEntries)
+	}
+	if got := bytes.Count(snapshot.joined, []byte(responsesWebsocketDeferredTruncationMarker)); got != 1 {
+		t.Fatalf("%s joined truncation markers = %d, want exactly 1", name, got)
+	}
+	if !bytes.HasSuffix(snapshot.joined, []byte(responsesWebsocketDeferredTruncationMarker)) {
+		t.Fatalf("%s joined snapshot does not end with the truncation marker and its two trailing newlines", name)
+	}
+	if len(snapshot.joined) > maxRenderedBytes {
+		t.Fatalf("%s joined snapshot = %d bytes, exceeds %d", name, len(snapshot.joined), maxRenderedBytes)
+	}
+}
+
+func TestResponsesWebsocketMarksModelRouterContextForDeferredRequestBounds(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		model     = "deferred-bounds-model"
+		authID    = "auth-deferred-bounds"
+		bodyBytes = 8 << 10
+	)
+	logBody := bytes.Repeat([]byte("x"), bodyBytes)
+
+	executor := &homeResponsesWebsocketExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: authID, Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+
+	routeHost := &responsesWebsocketDeferredRouteHost{
+		cfg:      &internalconfig.Config{},
+		executor: executor,
+		logInfo: executorhelps.UpstreamRequestLog{
+			URL:    "https://api.example.com/v1/responses",
+			Method: http.MethodPost,
+			Body:   logBody,
+		},
+		release:  make(chan struct{}),
+		observed: make(chan responsesWebsocketDeferredObservation, 1),
+	}
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	base.SetModelRouterHost(routeHost)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	// Cleanup runs LIFO: always release the gated router before the websocket
+	// connection and server close and before registry state is removed.
+	t.Cleanup(routeHost.Release)
+
+	request := []byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))
+	if errWrite := conn.WriteMessage(websocket.TextMessage, request); errWrite != nil {
+		t.Fatalf("write websocket request: %v", errWrite)
+	}
+
+	var observation responsesWebsocketDeferredObservation
+	select {
+	case observation = <-routeHost.observed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the gated model router observation")
+	}
+
+	if observation.err != nil {
+		t.Fatalf("deferred snapshot helper error: %v", observation.err)
+	}
+	if !observation.downstreamWebsocket {
+		t.Fatal("model router context is missing the downstream WebSocket marker")
+	}
+	if observation.sourceFormat != h.HandlerType() {
+		t.Fatalf("route source format = %q, want %q", observation.sourceFormat, h.HandlerType())
+	}
+	if observation.requestedModel != model {
+		t.Fatalf("route requested model = %q, want %q", observation.requestedModel, model)
+	}
+	if !observation.stream {
+		t.Fatal("route stream = false, want true for the responses websocket stream route")
+	}
+	if !bytes.Equal(observation.body, request) {
+		t.Fatalf("route body = %s, want the sent request %s", observation.body, request)
+	}
+	if observation.executorCalls != 0 {
+		t.Fatalf("executor calls = %d, want 0 while routing is gated", observation.executorCalls)
+	}
+	assertResponsesWebsocketDeferredSnapshot(t, "before", observation.before, logBody)
+	assertResponsesWebsocketDeferredSnapshot(t, "after", observation.after, logBody)
+	if !bytes.Equal(observation.before.joined, observation.after.joined) {
+		t.Fatal("deferred snapshot changed after 160 terminal recording calls, want byte-for-byte identical")
+	}
+
+	routeHost.Release()
+
+	if errDeadline := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); errDeadline != nil {
+		t.Fatalf("set read deadline: %v", errDeadline)
+	}
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read websocket response: %v", errRead)
+	}
+	if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+		t.Fatalf("response type = %q, want %q: %s", got, wsEventTypeCompleted, payload)
+	}
+	if got := executor.calls.Load(); got != 1 {
+		t.Fatalf("executor calls = %d, want 1 after releasing the gated route", got)
 	}
 }

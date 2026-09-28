@@ -523,3 +523,56 @@ func TestApplyClaudeHeaders_StructuredHelperBetaOrderPreservedWithAdvisor(t *tes
 		t.Fatalf("helper Anthropic-Beta =\n got:  %q\n want: %q", got, helperBeta)
 	}
 }
+
+func TestApplyClaudeHeaders_MidConversationEffortBetasFollowBody(t *testing.T) {
+	// Pi 0.85+ sends per-turn effort as output_config on mid-conversation system
+	// messages and pins thinking block binding. The cloak must forward the two
+	// enabling betas, otherwise Anthropic rejects the body with
+	// "messages.N.output_config: Extra inputs are not permitted".
+	req := newClaudeHeaderTestRequest(t, nil)
+	body := []byte(`{"model":"claude-fable-5-1","max_tokens":32,` +
+		`"thinking":{"type":"adaptive","display":"summarized","block_binding":{"prefix_mismatch_behavior":"drop_block"}},` +
+		`"messages":[{"role":"user","content":"hi"},` +
+		`{"role":"system","content":[],"output_config":{"effort":"high"}}]}`)
+	if err := applyClaudeHeaders(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, false, nil,
+		body, nil, nil, false); err != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", err)
+	}
+	got := req.Header.Get("Anthropic-Beta")
+	for _, want := range []string{claudeMidConvoOutputConfigBeta, claudeThinkingBindingControls} {
+		if !strings.Contains(","+got+",", ","+want+",") {
+			t.Fatalf("Anthropic-Beta = %q, want %q present", got, want)
+		}
+	}
+
+	// Without the body features and without requesting them, neither beta appears.
+	req = newClaudeHeaderTestRequest(t, nil)
+	body = []byte(`{"model":"claude-opus-5","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`)
+	if err := applyClaudeHeaders(req, claudeOAuthAuthForBetaPolicy(), claudeRaceProbeOAuthKey, false, nil,
+		body, nil, nil, false); err != nil {
+		t.Fatalf("applyClaudeHeaders() plain error = %v", err)
+	}
+	got = req.Header.Get("Anthropic-Beta")
+	for _, unwanted := range []string{claudeMidConvoOutputConfigBeta, claudeThinkingBindingControls} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("Anthropic-Beta = %q, want %q absent for a plain request", got, unwanted)
+		}
+	}
+}
+
+func TestClaudeLegacyMessageOutputConfigExcludesNativeTimingOnly(t *testing.T) {
+	for _, test := range []struct {
+		name, payload string
+		want          bool
+	}{
+		{"timing", `{"messages":[{"output_config":{"timing":{"now":"2026-09-26T00:00:00Z"}}}]}`, false},
+		{"effort", `{"messages":[{"output_config":{"effort":"high"}}]}`, true},
+		{"mixed", `{"messages":[{"output_config":{"timing":{},"effort":"high"}}]}`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := claudeBodyHasMessageOutputConfig([]byte(test.payload)); got != test.want {
+				t.Fatalf("legacy output-config beta needed = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
