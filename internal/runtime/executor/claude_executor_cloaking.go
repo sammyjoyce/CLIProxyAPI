@@ -2246,3 +2246,12 @@ func ensureModelMaxTokens(body []byte, modelID string) []byte {
 
 	return body
 }
+
+// claudeCallerRequested1hCache reports whether the caller's own payload (before
+// cloaking relocates system blocks and drops their markers) explicitly selected
+// the 1h cache pool on at least one breakpoint. Gateway policy: CPA-owned
+// breakpoints only join the 1h pool when the caller opted in; otherwise they
+// keep the API's 5m default.
+func claudeCallerRequested1hCache(payload []byte) bool {
+	return helps.ClaudePayloadHas1hTTL(payload)
+}
