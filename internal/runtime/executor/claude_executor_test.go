@@ -2436,7 +2436,7 @@ func TestClaudeExecutor_LegacySystemReminderAcrossMessagesAndStream(t *testing.T
 		if len(body) == 0 {
 			t.Fatalf("missing %s upstream capture", kind)
 		}
-		assertClaudeLegacySystemReminderLayout(t, body, "legacy-system-prompt", wantUser, "1h")
+		assertClaudeLegacySystemReminderLayout(t, body, "legacy-system-prompt", wantUser, "")
 		if _, ok := claudeBillingCCHDigitsOffset(body); !ok {
 			t.Fatalf("%s body is missing final CCH", kind)
 		}
@@ -5921,7 +5921,7 @@ func TestClaudeExecutor_SubagentAndProbeOmit1hCacheTTLAndBeta(t *testing.T) {
 	}
 
 	// 3. Normal interactive main-thread request: MUST carry 1h cache and beta
-	mainPayload := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hello"}]}`)
+	mainPayload := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
 	_, err = executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-sonnet-5",
 		Payload: mainPayload,
@@ -6399,7 +6399,7 @@ func TestClaudeExecutor_PayloadOverrideProbeToNormalReinitializes(t *testing.T) 
 
 	executor := NewClaudeExecutor(cfg)
 	// Initially a probe (max_tokens: 1, content: ".")
-	payload := []byte(`{"model":"claude-fable-5-1","thinking":{"type":"adaptive"},"max_tokens":1,"messages":[{"role":"user","content":"."}]}`)
+	payload := []byte(`{"model":"claude-fable-5-1","thinking":{"type":"adaptive"},"max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":".","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-fable-5-1",
 		Payload: payload,
@@ -7358,7 +7358,7 @@ func TestClaudeExecutor_UserTitlePromptWithoutSchemaTreatedAsNormalTurn(t *testi
 
 	executor := NewClaudeExecutor(cfg)
 	// Normal user query with text "Return a short title for this blog post", but NO structured output schema
-	payload := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":"Return a short title for this blog post"}]}`)
+	payload := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":[{"type":"text","text":"Return a short title for this blog post","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-sonnet-5",
 		Payload: payload,
@@ -8168,7 +8168,7 @@ func TestClaudeExecutor_ExecuteOAuthCustomToolMCPAliasRoundTrip(t *testing.T) {
 		},
 		Metadata: claudeOAuthTestMetadata(),
 	}
-	payload := []byte(`{"model":"claude-opus-5","system":"messages-system-prompt","messages":[{"role":"user","content":"search"}],"tools":[{"name":"search_web","description":"search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}`)
+	payload := []byte(`{"model":"claude-opus-5","system":"messages-system-prompt","messages":[{"role":"user","content":[{"type":"text","text":"search","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],"tools":[{"name":"search_web","description":"search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}`)
 	resp, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-opus-5",
 		Payload: payload,
@@ -8236,7 +8236,7 @@ func TestClaudeExecutor_ExecuteStreamOAuthCustomToolMCPAliasRoundTrip(t *testing
 			claudeauth.ClaudeDeviceIDsMetadataKey: deviceIDs,
 		},
 	}
-	payload := []byte(`{"model":"claude-opus-5","system":"stream-system-prompt","messages":[{"role":"user","content":"fetch"}],"tools":[{"name":"fetch_url","description":"fetch","input_schema":{"type":"object"}}],"stream":true}`)
+	payload := []byte(`{"model":"claude-opus-5","system":"stream-system-prompt","messages":[{"role":"user","content":[{"type":"text","text":"fetch","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],"tools":[{"name":"fetch_url","description":"fetch","input_schema":{"type":"object"}}],"stream":true}`)
 	result, errStream := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-opus-5",
 		Payload: payload,
@@ -9505,14 +9505,36 @@ func TestClaudeExecutor_CacheTTLIsPairedWithExtendedCacheTTLBeta(t *testing.T) {
 	tests := []struct {
 		name     string
 		apiKey   string
+		userCC   string
 		wantTTL  string
 		wantBeta bool
 	}{
 		{
-			name:     "oauth credential selects the 1h pool",
+			name:     "oauth credential selects the 1h pool when the caller asks for it",
 			apiKey:   "sk-ant-oat-cache-ttl-pairing",
+			userCC:   `,"cache_control":{"type":"ephemeral","ttl":"1h"}`,
 			wantTTL:  "1h",
 			wantBeta: true,
+		},
+		{
+			name:     "oauth credential keeps the 5m default for a bare marker",
+			apiKey:   "sk-ant-oat-cache-ttl-pairing",
+			userCC:   `,"cache_control":{"type":"ephemeral"}`,
+			wantTTL:  "",
+			wantBeta: false,
+		},
+		{
+			name:     "oauth credential keeps the 5m default for an explicit 5m marker",
+			apiKey:   "sk-ant-oat-cache-ttl-pairing",
+			userCC:   `,"cache_control":{"type":"ephemeral","ttl":"5m"}`,
+			wantTTL:  "",
+			wantBeta: false,
+		},
+		{
+			name:     "oauth credential keeps the 5m default without caller markers",
+			apiKey:   "sk-ant-oat-cache-ttl-pairing",
+			wantTTL:  "",
+			wantBeta: false,
 		},
 		{
 			name:     "api key credential keeps the default pool",
@@ -9545,7 +9567,7 @@ func TestClaudeExecutor_CacheTTLIsPairedWithExtendedCacheTTLBeta(t *testing.T) {
 			}
 			_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 				Model:   "claude-opus-4-6",
-				Payload: []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"x"}]}]}`),
+				Payload: []byte(`{"model":"claude-opus-4-6","messages":[{"role":"user","content":[{"type":"text","text":"x"` + test.userCC + `}]}]}`),
 			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
 			if errExecute != nil {
 				t.Fatalf("Execute() error = %v", errExecute)

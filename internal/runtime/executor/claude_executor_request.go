@@ -1299,6 +1299,11 @@ func applyClaudeHeadersWithNativeProfile(
 		}
 		if !reqProbeOrHelper && !countTokens && helps.ClaudePayloadHas1hTTL(body) {
 			baseBetas = withClaudeExtendedCacheTTLBeta(baseBetas)
+		} else if !confirmedClaudeCode && !preserveCallerFingerprint && !countTokens && !requestedMap[claudeExtendedCacheTTLBeta] {
+			// Gateway policy: CPA-owned bodies stay in the 5m pool unless the
+			// caller opted into 1h, and native declares extended-cache-ttl only
+			// alongside a 1h body ttl, so keep the beta paired with the body.
+			baseBetas = withoutClaudeBeta(baseBetas, claudeExtendedCacheTTLBeta)
 		}
 		reqModel := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "model").String()))
 		if isClaudeHaikuModel(reqModel) && !gjson.GetBytes(body, "fallbacks").Exists() && !helperProfile {
