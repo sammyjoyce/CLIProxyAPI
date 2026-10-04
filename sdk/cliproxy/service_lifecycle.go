@@ -91,6 +91,10 @@ func (s *Service) Run(ctx context.Context) error {
 			includeBaseline: true,
 			auths:           s.coreManager.List(),
 		})
+		// Bind models for the stored auths before the HTTP server accepts requests.
+		// Otherwise every routable model answers "unknown provider" until the
+		// watcher's first auth batch is processed, about a second after a restart.
+		s.registerModelsForAuthBatch(coreauth.WithSkipPersist(ctx), s.coreManager.List())
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(ctx, interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
