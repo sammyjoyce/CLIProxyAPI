@@ -1582,11 +1582,83 @@ func claudePayloadHasCacheableSystem(payload []byte) bool {
 // {"type":"ephemeral"} native default, which also avoids sending ttl to
 // Anthropic-compatible gateways that never advertised support for it.
 func upgradeClaudeCacheControlTTL(payload []byte, ttl string) []byte {
+	return upgradeClaudeCacheControlTTLThrough(payload, ttl, "")
+}
+
+// upgradeClaudeCallerCacheControlTTL upgrades bare breakpoints to 1h only up to
+// the breakpoint that closes the caller's 1h prefix. Later breakpoints keep the
+// 5m default the caller asked for; Anthropic only requires 1h entries to come
+// before 5m ones. Cloaking moves caller system blocks behind the first user turn
+// and rebuilds marked blocks without their ttl, so the prefix is located in the
+// cloaked body by surviving 1h ttls and by the text of every caller block up to
+// the caller's last 1h breakpoint (relocated system text may be wrapped as a
+// system reminder).
+// ponytail: text match; a later turn repeating prefix text widens the 1h range (cost only, never a 400).
+func upgradeClaudeCallerCacheControlTTL(payload, callerPayload []byte) []byte {
+	var callerTexts []string
+	prefixLen := 0
+	visit := func(text string, cacheControl gjson.Result) {
+		if text != "" {
+			callerTexts = append(callerTexts, text)
+		}
+		if cacheControl.Get("ttl").String() == claudeCacheControlTTL1h {
+			prefixLen = len(callerTexts)
+		}
+	}
+	visitContent := func(content gjson.Result) {
+		if content.Type == gjson.String {
+			visit(content.String(), gjson.Result{})
+			return
+		}
+		content.ForEach(func(_, block gjson.Result) bool {
+			visit(block.Get("text").String(), block.Get("cache_control"))
+			return true
+		})
+	}
+	gjson.GetBytes(callerPayload, "tools").ForEach(func(_, tool gjson.Result) bool {
+		visit("", tool.Get("cache_control"))
+		return true
+	})
+	visitContent(gjson.GetBytes(callerPayload, "system"))
+	gjson.GetBytes(callerPayload, "messages").ForEach(func(_, message gjson.Result) bool {
+		visitContent(message.Get("content"))
+		return true
+	})
+	caller1hTexts := make(map[string]bool, 2*prefixLen)
+	for _, text := range callerTexts[:prefixLen] {
+		caller1hTexts[text] = true
+		caller1hTexts[claudeCallerSystemReminder(text)] = true
+	}
+
+	through := ""
+	pending := false
+	forEachClaudeCacheControlBlock(payload, func(path string, block gjson.Result) {
+		if block.Get("cache_control.ttl").String() == claudeCacheControlTTL1h || caller1hTexts[block.Get("text").String()] {
+			pending = true
+		}
+		if pending && block.Get("cache_control").IsObject() {
+			through = path
+			pending = false
+		}
+	})
+	// An unlocated caller 1h block (empty through) keeps the old upgrade-all
+	// behavior so an explicit 1h request is never silently dropped.
+	return upgradeClaudeCacheControlTTLThrough(payload, claudeCacheControlTTL1h, through)
+}
+
+// upgradeClaudeCacheControlTTLThrough upgrades breakpoints in evaluation order
+// up to and including the block at path through; an empty through means all.
+func upgradeClaudeCacheControlTTLThrough(payload []byte, ttl, through string) []byte {
 	if ttl == "" || len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
 
+	done := false
 	upgrade := func(path string, block gjson.Result) {
+		if done {
+			return
+		}
+		done = path == through
 		cacheControl := block.Get("cache_control")
 		if !cacheControl.IsObject() || cacheControl.Get("ttl").Exists() {
 			return
