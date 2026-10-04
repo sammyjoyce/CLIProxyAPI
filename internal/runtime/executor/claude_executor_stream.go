@@ -183,7 +183,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// loops whose requests are seconds apart.
 	callerRequested1h := claudeCallerRequested1hCache(bodyBeforeCloaking)
 	if cpaOwnsCacheControl && callerRequested1h && fp.ProfileClaudeCodeCLI && (!isSubagent || subagent1h) && !isProbeOrHelper {
-		body = upgradeClaudeCacheControlTTL(body, claudeCacheControlTTL1h)
+		body = upgradeClaudeCallerCacheControlTTL(body, bodyBeforeCloaking)
 	} else if isProbeOrHelper || (isSubagent && !subagent1h) {
 		body = stripClaudeCacheControlTTL(body)
 	}
