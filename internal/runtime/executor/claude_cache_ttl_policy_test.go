@@ -29,6 +29,11 @@ func TestClaudeExecutor_CloakedOAuthCacheTTLFollowsCaller(t *testing.T) {
 		systemCC string
 		userCC   string
 		want1h   bool
+		// laterCC, when set, appends an assistant turn and a later user turn
+		// carrying this marker; wantLaterTTL is the ttl that turn must reach
+		// upstream with ("" is the 5m default).
+		laterCC      string
+		wantLaterTTL string
 	}{
 		{name: "bare system marker", systemCC: `,"cache_control":{"type":"ephemeral"}`},
 		{name: "explicit 5m system marker", systemCC: `,"cache_control":{"type":"ephemeral","ttl":"5m"}`},
@@ -39,6 +44,25 @@ func TestClaudeExecutor_CloakedOAuthCacheTTLFollowsCaller(t *testing.T) {
 			systemCC: `,"cache_control":{"type":"ephemeral","ttl":"1h"}`,
 			userCC:   `,"cache_control":{"type":"ephemeral","ttl":"5m"}`,
 			want1h:   true,
+		},
+		{
+			name:     "1h system keeps a later bare marker in the 5m pool",
+			systemCC: `,"cache_control":{"type":"ephemeral","ttl":"1h"}`,
+			laterCC:  `,"cache_control":{"type":"ephemeral"}`,
+			want1h:   true,
+		},
+		{
+			name:     "1h system keeps an unmarked later turn in the 5m pool",
+			systemCC: `,"cache_control":{"type":"ephemeral","ttl":"1h"}`,
+			laterCC:  " ",
+			want1h:   true,
+		},
+		{
+			name:         "1h on the later turn covers the whole prefix",
+			systemCC:     `,"cache_control":{"type":"ephemeral"}`,
+			laterCC:      `,"cache_control":{"type":"ephemeral","ttl":"1h"}`,
+			want1h:       true,
+			wantLaterTTL: "1h",
 		},
 	}
 	for _, tc := range cases {
@@ -76,9 +100,13 @@ func TestClaudeExecutor_CloakedOAuthCacheTTLFollowsCaller(t *testing.T) {
 					},
 					Metadata: claudeOAuthTestMetadata(),
 				}
+				laterTurn := ""
+				if tc.laterCC != "" {
+					laterTurn = `,{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"text","text":"later"` + strings.TrimSpace(tc.laterCC) + `}]}`
+				}
 				payload := []byte(`{"model":"claude-opus-4-6","max_tokens":64,` +
 					`"system":[{"type":"text","text":"caller system prompt"` + tc.systemCC + `}],` +
-					`"messages":[{"role":"user","content":[{"type":"text","text":"hi"` + tc.userCC + `}]}]}`)
+					`"messages":[{"role":"user","content":[{"type":"text","text":"hi"` + tc.userCC + `}]}` + laterTurn + `]}`)
 				req := cliproxyexecutor.Request{Model: "claude-opus-4-6", Payload: payload}
 				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload}
 				if stream {
@@ -109,6 +137,15 @@ func TestClaudeExecutor_CloakedOAuthCacheTTLFollowsCaller(t *testing.T) {
 				gotBeta := strings.Contains(seenHeaders.Get("Anthropic-Beta"), claudeExtendedCacheTTLBeta)
 				if gotBeta != tc.want1h {
 					t.Fatalf("extended-cache-ttl declared = %v, want %v: %s", gotBeta, tc.want1h, seenHeaders.Get("Anthropic-Beta"))
+				}
+				if tc.laterCC != "" {
+					later := gjson.GetBytes(seenBody, "messages.#(content.#(text==\"later\")).content.#(text==\"later\")")
+					if got := later.Get("cache_control.type").String(); got != "ephemeral" {
+						t.Fatalf("later user turn has no breakpoint: %s", seenBody)
+					}
+					if got := later.Get("cache_control.ttl").String(); got != tc.wantLaterTTL {
+						t.Fatalf("later user turn ttl = %q, want %q: %s", got, tc.wantLaterTTL, seenBody)
+					}
 				}
 				// Anthropic rejects a 1h breakpoint that follows a 5m one.
 				seen5m := false
