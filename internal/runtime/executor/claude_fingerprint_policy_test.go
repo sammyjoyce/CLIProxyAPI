@@ -235,7 +235,7 @@ func TestApplyClaudeHeaders_ClaudeCodeCLIProfileUsesOAuthBetasWithoutPretendingT
 	if errReq != nil {
 		t.Fatalf("NewRequest() error = %v", errReq)
 	}
-	payload := []byte(`{"model":"claude-sonnet-5"}`)
+	payload := []byte(`{"model":"claude-sonnet-5","system":[{"type":"text","text":"caller","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`)
 	if errHeaders := applyClaudeHeaders(req, auth, "key-third-party", false, nil, payload, &config.Config{}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
@@ -295,7 +295,7 @@ func TestApplyClaudeHeaders_OfficialAPIKeyClaudeCodeCLIProfileUsesOAuthBetas(t *
 	if errReq != nil {
 		t.Fatalf("NewRequest() error = %v", errReq)
 	}
-	if errHeaders := applyClaudeHeaders(req, auth, "key-official-fp", false, nil, []byte(`{"model":"claude-sonnet-5"}`), &config.Config{}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
+	if errHeaders := applyClaudeHeaders(req, auth, "key-official-fp", false, nil, []byte(`{"model":"claude-sonnet-5","system":[{"type":"text","text":"caller","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`), &config.Config{}, nil, false, "11111111-2222-4333-8444-555555555555"); errHeaders != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
 	}
 	if got := req.Header.Get("Authorization"); got != "" {
@@ -346,7 +346,7 @@ func TestClaudeExecutor_ClaudeCodeCLIFingerprintOnThirdPartyGateway(t *testing.T
 			"fingerprint_profile": "claude-code-cli",
 		},
 	}
-	payload := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":[{"type":"text","text":"What can you do?"}]}],"tools":[{"name":"read_file","description":"Read a file","input_schema":{"type":"object"}}]}`)
+	payload := []byte(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":[{"type":"text","text":"What can you do?","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],"tools":[{"name":"read_file","description":"Read a file","input_schema":{"type":"object"}}]}`)
 
 	response, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "claude-sonnet-5",
@@ -703,6 +703,9 @@ func TestKimiExecutor_ClaudeMessagesWithAndWithoutClaudeCodeCLIFingerprint(t *te
 
 	executor := NewKimiExecutor(&config.Config{})
 	payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`)
+	// The CLI-profile caller opts into the 1h cache pool, which is what pairs the
+	// full OAuth CLI beta set with extended-cache-ttl.
+	payload1h := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
 
 	// 1. Default Kimi OAuth: no fingerprint injection.
 	defaultAuth := &cliproxyauth.Auth{
@@ -738,10 +741,10 @@ func TestKimiExecutor_ClaudeMessagesWithAndWithoutClaudeCodeCLIFingerprint(t *te
 	}
 	_, errFP := executor.Execute(ctx, fpAuth, cliproxyexecutor.Request{
 		Model:   "kimi-k2.5(max)",
-		Payload: payload,
+		Payload: payload1h,
 	}, cliproxyexecutor.Options{
 		SourceFormat:    sdktranslator.FormatClaude,
-		OriginalRequest: payload,
+		OriginalRequest: payload1h,
 	})
 	if errFP != nil {
 		t.Fatalf("fingerprint Execute() error = %v", errFP)
@@ -833,7 +836,7 @@ func TestKimiExecutor_ClaudeCodeCLIProfileKeepsUnsignedBillingAndNativeCountToke
 					"fingerprint_profile": "claude-code-cli",
 				},
 			}
-			payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`)
+			payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
 			if errRun := test.run(ctx, NewKimiExecutor(&config.Config{}), auth, payload); errRun != nil {
 				t.Fatalf("request error = %v", errRun)
 			}

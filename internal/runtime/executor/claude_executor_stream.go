@@ -93,6 +93,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Apply cloaking (system prompt injection, fake user ID, sensitive word obfuscation)
 	// based on client type and configuration.
 	_, wireSettings := resolveClaudeWirePolicy(e.cfg, auth, apiKey, confirmedClaudeCode)
+	bodyBeforeCloaking := body
 	isProbeOrHelper := helps.IsClaudeProbeOrHelperRequest(body)
 	var cloaked bool
 	body, cloaked, err = applyCloakingInternal(
@@ -174,7 +175,14 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// probes omit both 1h cache and extended-cache-ttl.
 	isSubagent := helps.IsClaudeSubagentRequest(incomingHeaders, body)
 	subagent1h := isSubagent && helps.ClaudeSubagentRequests1h(incomingHeaders, body)
-	if cpaOwnsCacheControl && fp.ProfileClaudeCodeCLI && (!isSubagent || subagent1h) && !isProbeOrHelper {
+	//
+	// Gateway policy: only upgrade when the caller itself asked for the 1h pool
+	// (an explicit ttl "1h" on any of its own breakpoints). A bare
+	// {"type":"ephemeral"} from a non-native caller means the API's 5m default;
+	// forcing 1h doubled every cache write (2x vs 1.25x base input) for agent
+	// loops whose requests are seconds apart.
+	callerRequested1h := claudeCallerRequested1hCache(bodyBeforeCloaking)
+	if cpaOwnsCacheControl && callerRequested1h && fp.ProfileClaudeCodeCLI && (!isSubagent || subagent1h) && !isProbeOrHelper {
 		body = upgradeClaudeCacheControlTTL(body, claudeCacheControlTTL1h)
 	} else if isProbeOrHelper || (isSubagent && !subagent1h) {
 		body = stripClaudeCacheControlTTL(body)
